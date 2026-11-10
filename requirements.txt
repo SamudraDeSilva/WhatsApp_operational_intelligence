@@ -1,0 +1,7 @@
+# Core analytics and SQLite use the Python standard library only.
+# The following packages power Excel import/export, reports and the desktop collector.
+openpyxl>=3.1,<4
+customtkinter>=5.2,<6
+matplotlib>=3.8,<4
+playwright>=1.48,<2
+reportlab>=4.2,<5

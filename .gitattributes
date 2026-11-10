@@ -1,0 +1,4 @@
+* text=auto
+*.ipynb linguist-language=Jupyter Notebook
+*.db binary
+*.xlsx binary
