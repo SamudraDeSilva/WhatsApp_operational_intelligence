@@ -145,11 +145,21 @@ those measures. See `docs/architecture.md` for the integration boundary.
 
 ## Release checklist
 
-- Obtain written confirmation that this source code can legally be made public.
-- Review commits and notebook outputs for secrets, private datasets, employee details and company IP.
-- Test the GUI and browser collector locally with authorized test accounts.
-- Select a licence only after confirming who owns the work.
-- Publish the synthetic example database and templates, never live `data/` or sessions.
+## Documentation
+
+For a deeper understanding of the platform's design, implementation, and data management practices, refer to the following technical documentation:
+
+- [System Architecture](https://github.com/SamudraDeSilva/WhatsApp_operational_intelligence/blob/main/docs/architecture.md) — Application architecture, component interactions, and data processing workflows.
+- [Data Dictionary](https://github.com/SamudraDeSilva/WhatsApp_operational_intelligence/blob/main/docs/data_dictionary.md) — Database structure, field definitions, and operational reporting schema.
+- [Security Guidelines](https://github.com/SamudraDeSilva/WhatsApp_operational_intelligence/blob/main/SECURITY.md) — Data protection, privacy considerations, and responsible deployment practices.
+
+## Project Status
+
+**Version:** 2.8 — Demonstration Release
+
+This repository contains a demonstration implementation of the Operational Intelligence Platform, including synthetic datasets, automated reporting workflows, and executive analytics capabilities.
+
+Live integrations and deployment-specific configurations require additional setup, testing, and appropriate authorisation.
 
 See [the data dictionary](docs/data_dictionary.md),
 [architecture](docs/architecture.md) and [security guidance](SECURITY.md).
