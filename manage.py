@@ -16,6 +16,7 @@ TEMPLATES = PROJECT / 'templates'
 
 def bootstrap():
     core.init_db()
+    core.init_exception_db()
     core.DATA.mkdir(parents=True, exist_ok=True)
     for filename in ('WhatsAppData.xlsx', 'WhatsAppData_staging.csv'):
         destination = core.DATA / filename
@@ -65,6 +66,7 @@ def create_demo(path):
     try:
         core.DB = output
         core.init_db()
+        core.init_exception_db()
         count = core.demo_data(days=42, seed=42)
         with core.connect() as conn:
             ok = conn.execute('PRAGMA integrity_check').fetchone()[0]

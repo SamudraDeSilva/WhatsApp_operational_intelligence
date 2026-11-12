@@ -11,4 +11,5 @@ import core
 def empty_db(tmp_path, monkeypatch):
     monkeypatch.setattr(core, 'DB', tmp_path / 'test_operations.db')
     core.init_db()
+    core.init_exception_db()
     return core

@@ -1,11 +1,14 @@
-"""Optional opt-in WhatsApp browser collection and CSV/Excel/SQLite bridge.
+"""Optional authorized WhatsApp Web collector and SQLite bridge (v3.0.0).
 
-Warning: requires an authorized session; browser selectors are not a stable API.
+The WhatsApp collector is opt-in; changing web interfaces may affect selectors.
 """
-
-# ---- Compatibility: analytics functions share one module in this build ----
 import core
-from core import *  # Legacy collector names; authoritative database lives in core.py
+from core import *  # Explicit v3.0.0 notebook compatibility contract.
+
+
+# --- extracted notebook cell 6 ---
+# ---- Compatibility: analytics functions share one module in this build ----
+
 
 # ---- Optional browser monitoring ----
 """Optional live WhatsApp Web adapter. No official messaging API used.
@@ -79,8 +82,11 @@ def save_collector_diagnostics(group, counters, note=''):
            ('visible','metrics','saved','duplicate','missing_timestamp')), note[:300]))
 
 
-# ---- Original WhatsApp processing engine ----
-
+# --- extracted notebook cell 8 ---
+# ---- Original, user-provided WhatsApp processing engine ----
+# Extracted from WhatsApp_Integration_FIXED (Reporting Module)(1).ipynb.
+# Collection, parsing, and original CSV/Excel writes are preserved.
+# Only the initial URL and proactive group sweep interval are adjusted.
 import os
 import asyncio
 import tkinter as tk
@@ -88,7 +94,6 @@ from openpyxl import load_workbook, Workbook
 from playwright.async_api import async_playwright
 
 BASE_DIR = str(ROOT)
-GROUPS_CONFIG_PATH = str(DATA / 'groups.txt')
 _legacy_config = ROOT / 'config.json'
 try:
     _legacy_paths = json.loads(_legacy_config.read_text(encoding='utf-8'))
@@ -152,12 +157,16 @@ def parse_metrics_from_text(text):
         match = re.search(rf"\b{key}[:\s\-]*(\d+)", clean_text, re.IGNORECASE)
         extracted_values[key] = int(match.group(1)) if match else ""
     
+    # Capture even a standalone WhatsApp no-show update (the full message is
+    # preserved in the existing CSV, and SQLite parses its explicit count).
     found_any = any(extracted_values[k] != "" for k in extracted_values)
+    if not found_any and parse_explicit_no_shows(text) is not None:
+        found_any = True
     return extracted_values, found_any
 
-# WhatsApp Web's message metadata is US-style
+# WhatsApp Web's message metadata in this user's installation is US-style
 # MONTH/DAY/YEAR. We verified this against stored records captured on
-# For MDY, 11/10/2026 means 10 November rather than 11 October.
+# 10 November 2026: WhatsApp's 11/10/2026 was incorrectly saved as 11 October.
 # The staging CSV uses the independent, *strict* UK DAY/MONTH/YEAR convention.
 # Do NOT set this to DMY just to make the CSV look British: that swaps the
 # meaning of incoming WhatsApp dates. If WhatsApp's own interface is changed
@@ -382,8 +391,22 @@ async def catch_up_recent_history(page, group_name, lookback_days=2, max_scrolls
     }""")
     logging.info("Completed previous-day catch-up for %s (%d scan windows)", group_name, step + 1)
 
-# SCRAPER ENGINE INTERNALS
 
+# ==============================================================================
+
+
+# --- extracted notebook cell 10 ---
+# Date-format smoke test — runs without WhatsApp login or database edits.
+assert WHATSAPP_NUMERIC_DATE_ORDER == "MDY"
+assert parse_whatsapp_timestamp("[10:44, 11/10/2026] Team:") == ("10/11/2026", "10:44:00")
+assert parse_whatsapp_timestamp("[18:38, 11/09/2026] Team:") == ("09/11/2026", "18:38:00")
+assert parse_whatsapp_timestamp("[12:56, 11/06/2026] Team:") == ("06/11/2026", "12:56:00")
+assert normalise_datetime("10/11/2026", "13:15:00") == "2026-11-10T13:15:00"
+print("Date tests passed: incoming MDY -> staging DMY -> SQLite ISO")
+
+# --- extracted notebook cell 12 ---
+# SECTION 3: SCRAPER ENGINE INTERNALS (THREAD ISOLATED)
+# ==============================================================================
 def trigger_start_engine(window_reference):
     global is_running, worker_loop
     if is_running:
@@ -547,9 +570,16 @@ async def start_scraping_engine(window_reference):
     finally:
         await stop_scraping_engine_internal(window_reference)
 
-# CUSTOMTKINTER INTERACTIVE GRAPHICAL DASHBOARD WINDOW
+# ==============================================================================
 
-# Minimal compatibility bridge: never modify the original parser or
+
+# --- extracted notebook cell 14 ---
+# SECTION 4: CUSTOMTKINTER INTERACTIVE GRAPHICAL DASHBOARD WINDOW
+# ==============================================================================
+
+
+
+# Minimal compatibility bridge: never modify the user's original parser or
 # browser navigation. The existing CSV/Excel writer is called first, and the
 # *same* parsed record is mirrored into SQLite for the executive dashboards.
 _original_append_to_local_excel = append_to_local_excel

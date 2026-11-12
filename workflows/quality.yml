@@ -1,0 +1,21 @@
+name: Python quality checks
+on:
+  push:
+  pull_request:
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install headless test dependencies
+        run: python -m pip install --upgrade pip pytest 'openpyxl>=3.1,<4'
+      - name: Compile application modules
+        run: python -m compileall -q core.py collector.py desktop.py app.py manage.py
+      - name: Run import, account and exception regression tests
+        run: python -m pytest -q
