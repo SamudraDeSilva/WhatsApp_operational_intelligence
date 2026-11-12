@@ -1,47 +1,39 @@
-# Architecture
+# Architecture — v3.0.0
 
-```mermaid
-flowchart LR
-    A[Authorised WhatsApp Web session] -->|Opt-in, UI-dependent| B[Collector parser]
-    B --> C[Staging CSV]
-    B --> D[Local Excel workbook]
-    B --> E[(SQLite reports)]
-    F[Existing CSV or Excel files] -->|Manual import, deduplication| E
-    E --> G[Executive dashboard]
-    E --> H[Alerts and KPI analytics]
-    E --> I[CSV / XLSX / PDF / offline HTML exports]
+## Application layers
+
+```text
+Authorized WhatsApp Web browser session (optional)
+    │  Playwright collector / message parser
+    ▼
+CSV staging + Excel workbook (11 original columns)
+    │  ingestion and duplicate checks
+    ▼
+Local SQLite database  ──── ◀ Excel planned staffing tracker (read-only import)
+    │                       ◀ Manual staffing plan versions
+    ├── reports / safety metrics / alerts
+    ├── staffing plans / exception entries / audit log
+    ├── locally hashed user accounts / local sessions
+    ▼
+CustomTkinter dashboard (Overview, Workforce, Executive, Exceptions, Reports)
+    ├── PDF and interactive HTML snapshots
+    ├── CSV and Excel exports
+    └── Local report catalogue in data/reports/
 ```
 
-**Components**
+## Code modules
 
-- `core.py`: standard-library SQLite persistence, audit trail, metric parsing,
-  imports, summary and forecast functions, reports, synthetic seed data.
-- `collector.py`: opt-in WhatsApp Web/Playwright workflow, CSV/Excel persistence,
-  ingestion bridge and collector diagnostics.
-- `desktop.py`: CustomTkinter dashboard, group filters, alert review, monitoring
-  controls and exports.
-- `app.py`: GUI launcher.
-- `manage.py`: headless local database bootstrap, import and demo generation.
-- `notebooks/Operational_Intelligence_Demo.ipynb`: read-only, reproducible
-  exploration of the supplied schema and synthetic database.
+- `app.py`: graphical entry point.
+- `core.py`: SQLite, CSV/XLSX imports, analytics, staffing exceptions, user management and PDF/HTML exports; the notebook's core and exceptions cells are in the same module to keep internal references coherent.
+- `collector.py`: optional WhatsApp Web collector and bridge into `core.py`.
+- `desktop.py`: CustomTkinter interface.
+- `manage.py`: headless initialization, importing, database diagnostics, synthetic seed.
+- `notebooks/`: fully sourced v3.0.0 application notebook and separate demo notebook.
 
-**Database integrity**
+## Operational safeguards
 
-`reports.fingerprint` is a UNIQUE SHA-256 hash of normalized group/sender/time/message,
-so importing the same message from CSV and Excel will not duplicate it. SQLite uses
-write-ahead logging and a busy timeout. `audit` tracks imports and changes.
-`alerts`, `monitor_state`, and runtime-created `collection_diagnostics` are separate.
-
-**Date contract**
-
-Incoming WhatsApp metadata is **MDY** for the configured interface (`11/10/2026` =
-10 November 2026); the supplied CSV/Excel templates are **DMY** (`10/11/2026`);
-SQLite stores ISO (`2026-11-10T...`). These conversions must not be guessed.
-
-**Boundary / limitation**
-
-The two provided sheets have no populated rows and have no fields for manual
-pre-3pm changes, post-3pm changes, no-shows or shortages. The current database
-therefore models the 11 provided message-report fields; it does **not** claim
-to integrate those additional manual tracking categories. They would require
-separate source schemas, operational definitions and data validation.
+- CSV/Excel staging and the optional browser collector run only with locally stored files or authorized browser sessions.
+- Unknown values are stored as NULL, not guessed as zeros.
+- Local database, configuration files, credentials, browser profile and report catalogues are excluded from Git.
+- The Excel staffing plan import reads visible worksheet data only; ambiguous overlapping plans must be resolved manually.
+- This is a local desktop application, not a hosted web service. A session or local password does not secure an untrusted shared computer.

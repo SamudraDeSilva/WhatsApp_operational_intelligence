@@ -1,12 +1,12 @@
 """
-OPERATIONAL INTELLIGENCE v2.8 - DESKTOP + JUPYTER EXECUTIVE APPLICATION
+OPERATIONAL INTELLIGENCE v3.0.0 - DESKTOP + JUPYTER EXECUTIVE APPLICATION
 
 Run from VS Code with Python 3.10+:
   python -m pip install -r requirements.txt
   python -m playwright install chromium   # only for optional WhatsApp monitoring
-  python app.py
+  python app.py  # launch the modular desktop application
 
-The application stores local reports in SQLite under ./data/.
+The dashboard works completely locally using SQLite in ./data/.
 WhatsApp Web collection is optional and requires network access and user login.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ from pathlib import Path
 
 # A notebook has no __file__: resolve local assets relative to its working folder.
 # When running as a .py script, keep assets alongside that script instead.
+APP_VERSION = '3.0.0'
 ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True)
@@ -44,7 +45,7 @@ def group_registry(config=None):
     """Read a validated, ordered group register without breaking legacy settings.
 
     The original collector expects config['groups'] to be a list of enabled
-    group names. This richer register is UI-only metadata. Pre-v2.4 settings
+    group names. This richer register is UI-only metadata. Earlier-version settings
     are automatically shown as active entries without modifying the file.
     """
     cfg = config if config is not None else configuration()
@@ -173,8 +174,17 @@ def relocate_database(folder):
             Path(temp_name).unlink()
 
 
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit/rollback AND close after with-connect blocks (safe for 40+ groups)."""
+    def __exit__(self,exc_type,exc_value,traceback):
+        try:
+            return super().__exit__(exc_type,exc_value,traceback)
+        finally:
+            self.close()
+
+
 def connect():
-    con=sqlite3.connect(DB,timeout=15)
+    con=sqlite3.connect(DB,timeout=15,factory=_ClosingSQLiteConnection)
     con.row_factory=sqlite3.Row
     con.execute('PRAGMA busy_timeout=15000')
     con.execute('PRAGMA journal_mode=WAL')
@@ -188,7 +198,7 @@ def init_db():
           event_at TEXT NOT NULL, captured_at TEXT NOT NULL,
           group_name TEXT NOT NULL, sender TEXT NOT NULL, message TEXT NOT NULL,
           t002_t003 INTEGER, pwt INTEGER, spl INTEGER, pl INTEGER,
-          near_miss INTEGER, late INTEGER, origin TEXT NOT NULL DEFAULT 'import',
+          near_miss INTEGER, late INTEGER, no_shows INTEGER, origin TEXT NOT NULL DEFAULT 'import',
           quality_note TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_reports_event ON reports(event_at);
@@ -207,6 +217,15 @@ def init_db():
         );
         INSERT OR IGNORE INTO monitor_state(id,status) VALUES (1,'Stopped');
         ''')
+        columns = {r[1] for r in c.execute('PRAGMA table_info(reports)')}
+        if 'no_shows' not in columns:
+            c.execute('ALTER TABLE reports ADD COLUMN no_shows INTEGER')
+        # Existing CSVs/WhatsApp messages keep their original schema. Backfill
+        # only explicitly reported numeric no-show counts, never infer from gaps.
+        for message_id, raw in c.execute('SELECT id,message FROM reports WHERE no_shows IS NULL'):
+            n = parse_explicit_no_shows(raw)
+            if n is not None:
+                c.execute('UPDATE reports SET no_shows=? WHERE id=?', (n, message_id))
 
 def stamp(): return datetime.now().isoformat(timespec='seconds')
 
@@ -223,6 +242,17 @@ def parse_metrics(message):
         m=re.search(pattern,text,re.I)
         result[name]=int(m.group(1)) if m else None
     return result
+
+def parse_explicit_no_shows(message):
+    """Read a numeric no-show count only when WhatsApp explicitly provides one.
+
+    Examples: 'No Shows: 2', 'No-Show 1', 'No show(s) - 0'.
+    Missing mention is UNKNOWN, never zero and never equal to shortage.
+    """
+    text = ' '.join(str(message or '').split())
+    match = re.search(r'\bno[\s-]*shows?(?:\(s\))?\s*[:=\-]?\s*(\d{1,5})\b', text, re.I)
+    return int(match.group(1)) if match else None
+
 
 def parse_date(value):
     if isinstance(value,datetime): return value.date()
@@ -263,16 +293,21 @@ def insert_report(group,sender,message,dt,metrics=None,origin='manual'):
             if n < 0 or n > 100000: raise ValueError(f'Invalid {k} value: {v}')
             clean[k]=n
     token=fingerprint(group,sender,at,message)
+    reported_no_shows = parse_explicit_no_shows(message)
+    # Optional structured imports may include a separate No Shows column.
+    if metrics is not None and metrics.get('No Shows') not in (None, ''):
+        reported_no_shows = _ex_validate_nonneg(metrics['No Shows'], 'No Shows') if '_ex_validate_nonneg' in globals() else int(metrics['No Shows'])
     qnote='Missing safety fields' if clean['Near Miss'] is None or clean['Late'] is None else ''
     with connect() as c:
         cursor=c.execute('''INSERT OR IGNORE INTO reports
-          (fingerprint,event_at,captured_at,group_name,sender,message,t002_t003,pwt,spl,pl,near_miss,late,origin,quality_note)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-          (token,at,stamp(),group,sender,message,*(clean[k] for k in METRICS),origin,qnote))
+          (fingerprint,event_at,captured_at,group_name,sender,message,t002_t003,pwt,spl,pl,near_miss,late,no_shows,origin,quality_note)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (token,at,stamp(),group,sender,message,*(clean[k] for k in METRICS),reported_no_shows,origin,qnote))
         return cursor.rowcount==1
 
 # Only for automatic replay of the original historical staging CSV.
-# Dates from an earlier ambiguous parser require manual reconciliation.
+# These specific erroneous legacy dates were identified and explicitly
+# rejected by the user in the 10 November 2026 monitoring records.
 # Manual historical CSV imports are unaffected.
 KNOWN_MISDATED_LEGACY_DATES = frozenset({
     '2026-06-11', '2026-09-11', '2026-10-11'
@@ -286,8 +321,7 @@ def import_csv(path, *, quarantine_legacy_dates=False):
         absent={'Date','Time','Group'}-set(reader.fieldnames or [])
         if absent: raise ValueError(f'CSV missing required columns: {", ".join(sorted(absent))}')
         for number,row in enumerate(reader,2):
-            # Spreadsheet exports may include preformatted but empty rows.
-            # They are not rejected records; skip them before validating dates.
+            # A blank preformatted spreadsheet row is not an invalid report.
             if not any(str(value or "").strip() for value in row.values()):
                 continue
             try:
@@ -300,7 +334,7 @@ def import_csv(path, *, quarantine_legacy_dates=False):
                 if quarantine_legacy_dates and dt[:10] in KNOWN_MISDATED_LEGACY_DATES:
                     invalid.append(f'Row {number}: quarantined known legacy date {dt[:10]}')
                     continue
-                metric_values={k:row.get(k,'') for k in METRICS}
+                metric_values={**{k:row.get(k,'') for k in METRICS}, 'No Shows': row.get('No Shows', '')}
                 if all(v in ('',None) for v in metric_values.values()) and row.get('Full Message'): metric_values=parse_metrics(row['Full Message'])
                 inserted=insert_report(row['Group'],row.get('Sender') or 'Structured export',row.get('Full Message') or ('Structured import: ' + ' | '.join(f'{k}={metric_values.get(k,chr(45))}' for k in METRICS)),dt,metric_values,origin='csv')
                 added+=int(inserted); dupes+=int(not inserted)
@@ -601,118 +635,526 @@ def uk_chart_date(iso_day):
     return datetime.strptime(iso_day[:10], '%Y-%m-%d').strftime('%d-%m')
 
 
-def export_pdf(path,rows,scope='All Groups'):
-    """Locally generated PDF; same corrected workforce charts as GUI."""
-    from io import BytesIO
-    from reportlab.lib import colors as rlcolors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,Image,KeepTogether
+# ---------------------------------------------------------------------------
+# C-SUITE EXPORTS — SAME EXCEPTION MODEL AS EXECUTIVE DASHBOARD
+# ---------------------------------------------------------------------------
+# The previous PDF and HTML exporters only accepted WhatsApp message rows.
+# Exports now accept the complete exception_dashboard rows for the SAME scope.
+
+def _build_report_export_payload(rows, exception_rows=None):
+    """Build a lossless, offline reporting snapshot.
+
+    If exception_rows is omitted by a legacy caller, derive the applicable
+    group/date range from the supplied WhatsApp reports. The GUI always passes
+    the selected exception_dashboard explicitly, including before-report entries.
+    """
+    source_rows = list(rows or [])
+    if exception_rows is None:
+        if source_rows:
+            dates = sorted(r['event_at'][:10] for r in source_rows)
+            names = {r['group_name'].casefold() for r in source_rows}
+            selected = source_rows[0]['group_name'] if len(names) == 1 else 'All Groups'
+            exception_rows = exception_dashboard(dates[0], dates[-1], selected)['rows']
+        else:
+            exception_rows = []
+    role_names = list(EX_METRIC_FIELDS)
+    exceptions = []
+    for record in exception_rows:
+        roles = [{k:int(part.get(k,0)) for k in ('required','present','shortage','surplus')}
+                 | {'role':str(part.get('role',''))}
+                 for part in record.get('role_breakdown',[])]
+        exceptions.append({
+            'date':str(record['service_date']),
+            'group':str(record['group']),
+            'before':record.get('before_count'),
+            'after':record.get('after_count'),
+            'no_shows':record.get('no_shows'),
+            'required':record.get('plan_total'),
+            'available':record.get('available'),
+            'shortage':record.get('shortage'),
+            'status':str(record.get('status','Pending')),
+            'reason':str(record.get('reason') or ''),
+            'report_id':record.get('report_id'),
+            'roles':roles
+        })
+    exceptions.sort(key=lambda x:(x['date'],x['group'].casefold()),reverse=True)
+    # Night-shift attendance can be captured AFTER MIDNIGHT. If a source
+    # report is linked to an exception service date but falls outside the
+    # message-date UI filter, include that evidence explicitly and avoid a
+    # duplicate of any report already selected by message date.
+    linked_days={int(x['report_id']):x['date'] for x in exceptions
+                 if x['report_id'] is not None}
+    selected_ids={int(x['id']) for x in source_rows if x.get('id') is not None}
+    need_ids=sorted(set(linked_days)-selected_ids)
+    if need_ids:
+        with connect() as conn:
+            for start in range(0,len(need_ids),300):
+                batch=need_ids[start:start+300]
+                qmarks=','.join('?' for _ in batch)
+                source_rows.extend(dict(x) for x in conn.execute(
+                    'SELECT * FROM reports WHERE id IN ('+qmarks+')',batch))
+    reports = []
+    for r in source_rows:
+        reports.append({
+            'day':linked_days.get(r.get('id'),str(r['event_at'])[:10]),
+            'when':str(r['event_at'])[:19].replace('T',' '),
+            'group':str(r['group_name']),
+            'sender':str(r.get('sender') or ''),
+            **{k:r.get(k) for k in ('t002_t003','pwt','spl','pl','near_miss','late','no_shows')}
+        })
+    reports.sort(key=lambda x:(x['when'],x['group'].casefold()),reverse=True)
+    known = lambda k: [x for x in exceptions if x[k] is not None]
+    totals = {
+        'reports':len(reports),
+        'groups':len({x['group'] for x in exceptions} | {x['group'] for x in reports}),
+        'changes_before':sum(int(x['before']) for x in known('before')),
+        'changes_after':sum(int(x['after']) for x in known('after')),
+        'before_known':len(known('before')),
+        'after_known':len(known('after')),
+        'no_shows':sum(int(x['no_shows']) for x in known('no_shows')),
+        'no_shows_known':len(known('no_shows')),
+        'shortage':sum(int(x['shortage']) for x in known('shortage')),
+        'shortage_known':len(known('shortage')),
+        'pending':sum(x['shortage'] is None for x in exceptions),
+        'changes_complete':sum(x['before'] is not None and x['after'] is not None for x in exceptions),
+        'near_miss':sum(int(x['near_miss'] or 0) for x in reports),
+        'late':sum(int(x['late'] or 0) for x in reports)
+    }
+    return {'reports':reports,'exceptions':exceptions,'totals':totals,
+            'roles':role_names,'generated_at':stamp()}
+
+
+def export_interactive_html(path, rows, scope='All Groups', exception_rows=None):
+    """Full-fidelity offline executive HTML with filtering and 4-category charts."""
+    import html as _htmlmod
+    payload=_build_report_export_payload(rows,exception_rows)
+    # Encode script-breaking characters even when strings come from WhatsApp.
+    embedded=json.dumps(payload,ensure_ascii=True,separators=(',',':'))
+    for ch,replacement in [('<',r'\u003c'),('>',r'\u003e'),('&',r'\u0026'),
+                           ('\u2028',r'\u2028'),('\u2029',r'\u2029')]:
+        embedded=embedded.replace(ch,replacement)
+    output=_HTML_REPORT_TEMPLATE.replace('__PAYLOAD__',embedded)
+    output=output.replace('__SCOPE__',_htmlmod.escape(str(scope),quote=True))
+    output=output.replace('__GENERATED__',_htmlmod.escape(payload['generated_at'],quote=True))
+    Path(path).write_text(output,encoding='utf-8')
+    audit('HTML_EXPORT',f'{scope} / {len(payload["exceptions"])} exception records')
+    return path
+
+
+
+# -------------------------------------------------------------------------
+# v3.0.0: Additional board charts matching existing Workforce / Safety views.
+# All chart data is derived from the same exported WhatsApp report snapshot.
+# -------------------------------------------------------------------------
+def _report_chart_dataset(report_rows):
+    gang = {}
+    near = {}
+    roles = ('t002_t003','pwt','spl','pl')
+    allocation = {key: 0 for key in roles}
+    for row in report_rows:
+        name = str(row.get('group') or 'Unknown group')
+        values = gang.setdefault(name,{key:0 for key in (*roles,'late')})
+        for key in values:
+            values[key] += int(row.get(key) or 0)
+        near[name] = near.get(name,0) + int(row.get('near_miss') or 0)
+        for key in roles:
+            allocation[key] += int(row.get(key) or 0)
+    return {'gang':gang, 'near':near, 'allocation':allocation}
+
+def _append_pdf_workforce_and_safety_charts(story,reports,heading,p,figimage):
     from matplotlib.figure import Figure
-    info=summary(rows,configuration()['groups']);st=getSampleStyleSheet()
-    class Doc(SimpleDocTemplate):
-        def afterFlowable(self,flowable):
-            anchor=getattr(flowable,'_section_anchor',None)
-            if anchor:self.canv.bookmarkPage(anchor)
-    doc=Doc(str(path),pagesize=A4,leftMargin=42,rightMargin=42,topMargin=35,bottomMargin=35)
-    def heading(text,anchor):
-        h=Paragraph(text,st['Heading2']);h._section_anchor=anchor;return h
-    def chart(fig,width=480,height=195):
-        bio=BytesIO();fig.savefig(bio,format='png',dpi=125,facecolor='white',bbox_inches='tight');bio.seek(0)
-        return Image(bio,width=width,height=height)
-    story=[Paragraph('OPERATIONAL INTELLIGENCE | EXECUTIVE BRIEF',st['Title']),
-        Paragraph(f'Scope: {scope} | Generated {stamp()} | Local database',st['Normal']),Spacer(1,10),
-        Paragraph('Sections: <link href="#kpis">KPIs</link> | <link href="#risk">Safety</link> | <link href="#workforce">Workforce</link> | <link href="#teams">Gang attendance</link>',st['Normal']),
-        Spacer(1,13),heading('Executive summary','kpis')]
-    complete, total, completeness=safety_completeness(rows)
-    completeness_text=f'{completeness:.1f}%' if completeness is not None else '—'
-    t=Table([['Captured reports','Reporting teams','Near Miss','Safety data completeness'],
-             [str(info['reports']),str(info['teams']),str(info['near_miss']),completeness_text]],
-             colWidths=[125]*4,rowHeights=30)
-    t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),rlcolors.HexColor('#17243A')),
-       ('TEXTCOLOR',(0,0),(-1,0),rlcolors.white),('BACKGROUND',(0,1),(-1,1),rlcolors.HexColor('#EAF0F8')),
-       ('ALIGN',(0,0),(-1,-1),'CENTER'),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold')]))
-    story.extend([t,Spacer(1,14),heading('Near-miss reporting','risk')])
-    fig=Figure(figsize=(7.1,2.4));ax=fig.add_subplot(111)
-    plot_near_miss_calendar(ax, rows, dark=False)
-    fig.tight_layout()
-    story.append(chart(fig,height=170))
-    story.append(Paragraph(
-        'Only dates with received reports are displayed. A zero bar means a report recorded zero near-miss values.',
-        st['Normal']))
-    fig=Figure(figsize=(5.4,2.4));ax=fig.add_subplot(111)
-    per_gang=near_miss_by_group(rows)
-    gang_names=list(per_gang);gang_values=list(per_gang.values())
-    gang_colors=['#d35400','#2980b9','#27ae60','#8e44ad','#f39c12','#16a085']
-    original_style_pie(ax,gang_names,gang_values,
-                       [gang_colors[i%len(gang_colors)] for i in range(len(gang_names))],dark=False)
-    fig.tight_layout();story.append(chart(fig,width=380,height=170))
-    story.append(Paragraph('Pie shows the share of reported near-miss values by gang, not verified incident rates. '
-                           f'Safety fields complete in {complete} of {total} reports.',st['Italic']))
-    story.extend([Spacer(1,12),heading('Workforce category volumes and allocation','workforce')])
-    names=['T002/T003','PWT','SPL','PL'];values=workforce_totals(rows)
-    palette=['#2980b9','#2ecc71','#e67e22','#e74c3c']
-    fig=Figure(figsize=(7,2.5));ax=fig.add_subplot(111)
-    bars=ax.bar(names,values,color=palette,width=.5)
-    for b in bars:
-        if b.get_height():ax.annotate(f'{b.get_height():.0f}',(b.get_x()+b.get_width()/2,b.get_height()),ha='center',va='bottom',fontsize=8)
-    ax.tick_params(labelsize=9);fig.tight_layout();story.append(chart(fig,height=170))
-    fig=Figure(figsize=(5.5,2.65));ax=fig.add_subplot(111)
-    original_style_pie(ax,names,values,palette,dark=False);fig.tight_layout();story.append(chart(fig,width=390,height=195))
-    story.append(Paragraph('Workforce percentages use only T002/T003, PWT, SPL and PL reported totals; repeated messages may not represent unique people.',st['Italic']))
-    story.extend([Spacer(1,12),heading('Gang-wise attendance including Late','teams')])
-    gangs=gang_attendance(rows)
-    if gangs:
-        gang_names=list(gangs)[:12]
-        fields=['t002_t003','pwt','spl','pl','late']
-        captions=['T002/T003','PWT','SPL','PL','Late']
-        gang_palette=['#2980b9','#2ecc71','#e67e22','#e74c3c','#f1c40f']
-        fig=Figure(figsize=(7.2,3.1));ax=fig.add_subplot(111)
-        positions=list(range(len(gang_names)));width=.16
-        for j,(key,label,color) in enumerate(zip(fields,captions,gang_palette)):
-            ax.bar([i+(j-2)*width for i in positions],
-                   [gangs[name][key] for name in gang_names],width,
-                   label=label,color=color)
-        ax.set_xticks(positions);ax.set_xticklabels(gang_names,rotation=20,ha='right',fontsize=8)
-        ax.legend(fontsize=7,ncol=5);ax.tick_params(labelsize=8)
-        fig.tight_layout();story.append(chart(fig,height=210))
-    else:story.append(Paragraph('No gang attendance data in this period.',st['Normal']))
-    story.append(Paragraph('Late figures are presented only as a separate attendance bar series; '
-                           'they are excluded from workforce allocation percentages.',st['Italic']))
-    story.extend([Spacer(1,10),Paragraph(f'Incomplete Near Miss or Late fields: {info["missing_safety"]}. Missing values are not confirmed zeroes.',st['Normal']),
-                  Paragraph('Interactive filtering is available in the companion offline HTML export.',st['Italic'])])
-    doc.build(story);audit('PDF_EXPORT',scope)
+    metrics=_report_chart_dataset(reports)
+    columns=[('t002_t003','T002/T003','#2980b9'),('pwt','PWT','#2ecc71'),
+             ('spl','SPL','#e67e22'),('pl','PL','#e74c3c'),('late','Late','#f1c40f')]
+    story.append(heading('Gang-wise attendance — stacked horizontal comparison'))
+    names=sorted(metrics['gang'],key=str.casefold)
+    if names:
+        for start in range(0,len(names),12):
+            segment=names[start:start+12]
+            fig=Figure(figsize=(8.2,max(2.5,.38*len(segment)+1.0)))
+            ax=fig.add_subplot(111)
+            y=list(range(len(segment)));left=[0]*len(segment)
+            for key,title,color in columns:
+                v=[metrics['gang'][name][key] for name in segment]
+                ax.barh(y,v,left=left,label=title,color=color,height=.68)
+                left=[a+b for a,b in zip(left,v)]
+            ax.set_yticks(y,[(n[:26]+'…') if len(n)>27 else n for n in segment],fontsize=8)
+            ax.invert_yaxis();ax.grid(axis='x',alpha=.18);ax.set_axisbelow(True)
+            ax.legend(loc='lower center',bbox_to_anchor=(.5,1.02),ncol=5,fontsize=7,frameon=False)
+            fig.subplots_adjust(left=.29,right=.97,bottom=.09,top=.86)
+            if len(names)>12:
+                story.append(p(f'Groups {start+1}–{start+len(segment)} of {len(names)}','ReportSmall'))
+            story.append(figimage(fig,min(350,max(155,70+21*len(segment)))))
+    else:
+        story.append(p('No gang-wise WhatsApp attendance in the selected period.'))
+    story.append(p('Stacked bars use T002/T003, PWT, SPL and PL reported values by group. '
+                   'Late is a separate attendance exception indicator, not a staffing role. '
+                   'Multiple WhatsApp messages may include the same people.','ReportSmall'))
+    from reportlab.platypus import KeepTogether
+    positive=sorted(((g,n) for g,n in metrics['near'].items() if n>0),
+                    key=lambda x:(-x[1],x[0].casefold()))
+    if len(positive)>12:
+        display_near=positive[:11]+[('Other groups',sum(v for _,v in positive[11:]))]
+    else:
+        display_near=positive
+    role_labels=[('t002_t003','T002/T003'),('pwt','PWT'),('spl','SPL'),('pl','PL')]
+    allocation=[(title,metrics['allocation'][key]) for key,title in role_labels
+                if metrics['allocation'][key]>0]
+    fig=Figure(figsize=(8.2,4.2))
+    ax1=fig.add_subplot(121);ax2=fig.add_subplot(122)
+    near_colors=['#d35400','#2980b9','#27ae60','#8e44ad','#f39c12',
+                 '#16a085','#c0392b','#597cbb','#ae7ac0','#b9a045','#7a9e49','#e18a71']
+    def add_pie(ax,items,colors,title):
+        ax.set_title(title,fontsize=10,pad=8,color='#15263E')
+        if not items:
+            ax.text(.5,.5,'No positive reported values',ha='center',va='center',
+                    fontsize=9,transform=ax.transAxes)
+            ax.axis('off');return
+        total=sum(v for _,v in items)
+        ax.pie([v for _,v in items],startangle=135,
+               colors=[colors[i%len(colors)] for i in range(len(items))],
+               autopct=lambda pct:f'{pct:.0f}%' if pct>=5 else '',pctdistance=.75,
+               textprops={'fontsize':7,'color':'white'},
+               wedgeprops={'linewidth':.7,'edgecolor':'white'})
+        ax.legend([f'{name[:18]}  {100*v/total:.1f}%' for name,v in items],
+                  loc='upper center',bbox_to_anchor=(.5,-.02),fontsize=6.7,
+                  frameon=False,ncol=2 if len(items)>6 else 1)
+        ax.set_aspect('equal')
+    add_pie(ax1,display_near,near_colors,'Near misses by group')
+    add_pie(ax2,allocation,['#4d9ff8','#18c4ac','#f3c66b','#a78bfa'],
+            'Workforce allocation by role')
+    fig.subplots_adjust(left=.03,right=.97,top=.90,bottom=.19,wspace=.21)
+    story.append(figimage(fig,260))
+    note=('For readability, smaller group shares are combined under Other groups in the PDF; '
+          'the HTML displays each group separately. ' if len(positive)>12 else '')
+    story.append(KeepTogether([
+        heading('Near-miss share by group and workforce allocation'),
+        figimage(fig,260),
+        p(note+'Near-miss percentages show each group’s share of reported near-miss values, '
+          'not confirmed incidents or per-employee risk. Workforce allocation percentages '
+          'use reported T002/T003, PWT, SPL and PL values only; Late is excluded.','ReportSmall')
+    ]))
 
-def export_interactive_html(path, rows, scope='All Groups'):
-    """Self-contained, interactive HTML for local offline exploration."""
-    import html
-    data=[{'day':r['event_at'][:10], 'group':r['group_name'],
-           'sender':r.get('sender') or '',
-           'values':[r[k] for k in ('t002_t003','pwt','spl','pl','near_miss','late')]} for r in rows]
-    data_json=json.dumps(data,ensure_ascii=True).replace('</','<\\/')
-    # No external script, CDN, web API, or online library.
-    template="""<!doctype html><html><head><meta charset='utf-8'><title>Interactive Executive Report</title>
-<style>body{background:#0c1523;color:#eff5fd;font:15px system-ui;margin:0}main{max-width:1100px;margin:auto;padding:30px}h1{font-size:26px}p{color:#a9bed4}select{background:#273a53;color:white;border:1px solid #5b7895;padding:10px;border-radius:9px}.top{display:flex;gap:18px;margin:20px 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.panel{background:#192a40;border:1px solid #354b65;border-radius:12px;padding:16px}.kpi{font-size:26px;color:#73beff;font-weight:bold}.charts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0}.bars{display:flex;align-items:end;gap:3px;height:160px;border-bottom:1px solid #668;overflow:hidden}.bar{background:#59bee9;flex:1;min-width:2px}.pie{width:155px;height:155px;border-radius:50%;margin:12px auto;background:#273a53}.wfrow{display:grid;grid-template-columns:90px 1fr 52px;align-items:center;gap:8px;margin:10px 0}.wftrack{background:#263a54;height:16px;border-radius:5px;overflow:hidden}.wffill{height:100%}input{background:#273a53;color:white;border:1px solid #5b7895;padding:8px;border-radius:7px}.legend{display:flex;gap:10px;flex-wrap:wrap}.legend span{padding:8px}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #334760;text-align:left}@media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}.top{flex-wrap:wrap}}</style></head><body><main><h1>Operational Intelligence — Executive Report</h1><p>Offline and interactive • SCOPE_TEXT • GENERATED_TEXT</p><div class='top'><label>Team <select id='team'></select></label><label>Period <select id='period'><option value='all'>All time</option><option value='today'>Today</option><option value='yesterday'>Yesterday</option><option value='7'>7 days</option><option value='30'>30 days</option><option value='90'>90 days</option><option value='custom'>Custom</option></select></label><label>From <input id='from' type='date'></label><label>To <input id='to' type='date'></label></div><div id='cards' class='grid'></div><div class='charts'><section class='panel'><h3>Daily near-miss reports</h3><div id='daily' class='bars'></div></section><section class='panel'><h3>Near-miss distribution by gang</h3><div id='riskpie' class='pie'></div><div id='risklegend' class='legend'></div></section></div><div class='charts'><section class='panel'><h3>Gang-wise attendance including Late</h3><div id='workforcebars'></div></section><section class='panel'><h3>Workforce allocation (reported totals)</h3><div id='workforcepie' class='pie'></div><div id='allocation' class='legend'></div></section></div><section class='panel'><h3>Recent workforce reports (most recent 100)</h3><div style='overflow:auto'><table><thead><tr><th>Date</th><th>Team</th><th>Sender</th><th>T002/T003</th><th>PWT</th><th>SPL</th><th>PL</th><th>Near Miss</th><th>Late</th></tr></thead><tbody id='body'></tbody></table></div></section><p>Figures reflect unverified message reports. Missing values are not confirmed zeroes. All controls run entirely in this local HTML file.</p></main><script>
-const data=DATA_JSON, el=id=>document.getElementById(id), e=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let names=['All Groups',...new Set(data.map(x=>x.group))];el('team').innerHTML=names.map(n=>'<option>'+e(n)+'</option>').join('');
-function draw(){let team=el('team').value,days=el('period').value,top=data.map(x=>x.day).sort().at(-1);let cutoff='',exact='';if(days==='today'||days==='yesterday'){let d=new Date();if(days==='yesterday')d.setDate(d.getDate()-1);exact=[d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-')}else if(top&&days!=='all'&&days!=='custom'){let d=new Date(top+'T12:00:00');d.setDate(d.getDate()-Number(days)+1);cutoff=d.toISOString().slice(0,10)}let from=el('from').value,to=el('to').value;let a=data.filter(x=>(team==='All Groups'||x.group===team)&&(!cutoff||x.day>=cutoff)&&(!exact||x.day===exact)&&(days!=='custom'||((!from||x.day>=from)&&(!to||x.day<=to))));
-let sum=i=>a.reduce((n,x)=>n+Number(x.values[i]??0),0),cards=[['Reports',a.length],['Reporting teams',new Set(a.map(x=>x.group)).size],['Near-miss values',sum(4)],['Safety completeness', a.length ? (100*a.filter(x=>x.values[4]!==null && x.values[5]!==null).length/a.length).toFixed(1)+'%' : '—']];el('cards').innerHTML=cards.map(c=>'<div class="panel"><p>'+c[0]+'</p><div class="kpi">'+c[1]+'</div></div>').join('');
-let daily={};a.forEach(x=>daily[x.day]=(daily[x.day]||0)+Number(x.values[4]??0));let dates=Object.keys(daily).sort(),max=Math.max(1,...Object.values(daily));el('daily').innerHTML=dates.map(d=>'<div class="bar" style="height:'+Math.max(1,daily[d]/max*100)+'%" title="'+e(d)+': '+daily[d]+' reports"></div>').join('');
-let colors=['#70baff','#67d9ba','#f5c76e','#f48e98'],labels=['T002/T003','PWT','SPL','PL'],total=[0,1,2,3].reduce((n,i)=>n+sum(i),0);el('allocation').innerHTML=labels.map((t,i)=>'<span style="color:'+colors[i]+'">'+t+': '+sum(i)+' ('+(total?(100*sum(i)/total).toFixed(1):'0')+'%)</span>').join('');
-let angle=0,segments=[];labels.forEach((t,i)=>{let next=angle+(total?sum(i)/total*360:0);segments.push(colors[i]+' '+angle+'deg '+next+'deg');angle=next;});el('workforcepie').style.background=total?'conic-gradient('+segments.join(',')+')':'#273a53';
-let gangTotals={};a.forEach(x=>{let g=gangTotals[x.group]||(gangTotals[x.group]=[0,0,0,0,0]);[0,1,2,3,5].forEach((k,i)=>g[i]+=Number(x.values[k]??0))});
-let gp=['T002/T003','PWT','SPL','PL','Late'],gc=['#70baff','#67d9ba','#f5c76e','#f48e98','#f1c40f'];
-let bars=Object.keys(gangTotals).sort().map(g=>'<div style="margin:12px 0"><strong>'+e(g)+'</strong><div class="legend">'+gp.map((t,i)=>'<span style="color:'+gc[i]+'">'+t+': '+gangTotals[g][i]+'</span>').join('')+'</div><div style="display:flex;gap:5px;align-items:end;height:90px">'+gp.map((t,i)=>{let m=Math.max(1,...Object.values(gangTotals).flat());return '<div title="'+e(t)+': '+gangTotals[g][i]+'" style="flex:1;height:'+Math.max(2,gangTotals[g][i]/m*100)+'%;background:'+gc[i]+';border-radius:3px"></div>'}).join('')+'</div></div>').join('');el('workforcebars').innerHTML=bars||'<p>No gang attendance data</p>';
-let nearByGang={};a.forEach(x=>nearByGang[x.group]=(nearByGang[x.group]||0)+Number(x.values[4]??0));let risk=Object.values(nearByGang).reduce((n,v)=>n+v,0),angle2=0,segments2=[];
-Object.keys(nearByGang).sort().forEach((g,i)=>{let next=angle2+(risk?nearByGang[g]/risk*100:0);segments2.push(gc[i%gc.length]+' '+angle2+'% '+next+'%');angle2=next});
-el('riskpie').style.background=risk?'conic-gradient('+segments2.join(',')+')':'#273a53';
-el('risklegend').innerHTML=Object.keys(nearByGang).sort().map((g,i)=>'<span style="color:'+gc[i%gc.length]+'">'+e(g)+' '+nearByGang[g]+' ('+(risk?100*nearByGang[g]/risk:0).toFixed(1)+'%)</span>').join('');
+def export_pdf(path, rows, scope='All Groups', exception_rows=None):
+    """Board-ready PDF containing both source WhatsApp and staffing exceptions.
 
-el('body').innerHTML=a.slice(0,100).map(x=>'<tr><td>'+e(x.day)+'</td><td>'+e(x.group)+'</td><td>'+e(x.sender||'—')+'</td>'+x.values.map(y=>'<td>'+e(y??'—')+'</td>').join('')+'</tr>').join('');}
-el('team').onchange=draw;el('period').onchange=draw;el('from').onchange=()=>{el('period').value='custom';draw()};el('to').onchange=()=>{el('period').value='custom';draw()};draw();</script></body></html>"""
-    template=template.replace('DATA_JSON',data_json).replace('SCOPE_TEXT',html.escape(scope)).replace('GENERATED_TEXT',stamp())
-    Path(path).write_text(template,encoding='utf-8')
-    audit('HTML_EXPORT',scope)
+    Multi-page with charts, quality status, detailed exception register, and
+    a bounded message appendix. The HTML export preserves *every* source row.
+    """
+    from io import BytesIO
+    from xml.sax.saxutils import escape as X
+    from matplotlib.figure import Figure
+    from reportlab.lib import colors as C
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                     TableStyle, Image, PageBreak, KeepTogether)
+    dataset=_build_report_export_payload(rows,exception_rows)
+    e=dataset['exceptions'];r=dataset['reports'];t=dataset['totals']
+    navy='#15263E';blue='#4d9ff8';teal='#18c4ac';purple='#a78bfa';red='#fb7185';gold='#f3c66b'
+    series=[('before','Changes before 15:00',blue),('after','Changes after 15:00',teal),
+            ('no_shows','No Shows',purple),('shortage','Shortages',red)]
+    def display(value):
+        return '—' if value is None else str(value)
+    def shortened(name,n=23):
+        return name[:n-1]+'…' if len(name)>n else name
+    styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='ReportTitle',parent=styles['Title'],fontName='Helvetica-Bold',fontSize=20,
+                              leading=24,textColor=C.HexColor(navy),spaceAfter=9))
+    styles.add(ParagraphStyle(name='ReportSection',parent=styles['Heading2'],fontName='Helvetica-Bold',fontSize=13,
+                              leading=17,textColor=C.HexColor(navy),spaceBefore=15,spaceAfter=8))
+    styles.add(ParagraphStyle(name='ReportBody',parent=styles['Normal'],fontSize=8.6,leading=12,
+                              textColor=C.HexColor('#35475A'),spaceAfter=7))
+    styles.add(ParagraphStyle(name='ReportSmall',parent=styles['Normal'],fontSize=7.2,leading=10,
+                              textColor=C.HexColor('#53667A'),spaceAfter=7))
+    styles.add(ParagraphStyle(name='ReportLabel',parent=styles['Normal'],fontName='Helvetica-Bold',fontSize=8,
+                              textColor=C.HexColor('#62728A')))
+    doc=SimpleDocTemplate(str(path),pagesize=A4,
+         leftMargin=43,rightMargin=43,topMargin=48,bottomMargin=43,
+         title='Operational Intelligence - Executive Reporting',author='Operational Intelligence')
+    width=A4[0]-86
+    def footer(canvas, _doc):
+        canvas.saveState()
+        canvas.setStrokeColor(C.HexColor('#D7E0E9'));canvas.line(43,37,A4[0]-43,37)
+        canvas.setFont('Helvetica',7);canvas.setFillColor(C.HexColor('#586C80'))
+        canvas.drawString(43,26,'INTERNAL • Operational Intelligence • Point-in-time snapshot')
+        canvas.drawRightString(A4[0]-43,26,f'Page {_doc.page}')
+        canvas.restoreState()
+    def p(text,style='ReportBody'):
+        return Paragraph(X(str(text)),styles[style])
+    def heading(text):return Paragraph(X(text),styles['ReportSection'])
+    def figimage(fig,h=190):
+        stream=BytesIO();fig.savefig(stream,format='png',dpi=125,bbox_inches='tight',facecolor='white');stream.seek(0)
+        image=Image(stream,width=width,height=h)
+        image.hAlign='CENTER'
+        return image
+    def table(items,colWidths,small=7,firstrow=True):
+        raw=[[str(v) for v in row] for row in items]
+        tbl=Table(raw,colWidths=colWidths,repeatRows=1 if firstrow else 0,hAlign='LEFT')
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND',(0,0),(-1,0),C.HexColor(navy)),
+            ('TEXTCOLOR',(0,0),(-1,0),C.white),
+            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ('FONTSIZE',(0,0),(-1,-1),small),
+            ('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6),
+            ('LINEBELOW',(0,0),(-1,-1),.3,C.HexColor('#E2E9F0')),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[C.white,C.HexColor('#F1F5F9')]),
+            ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ]))
+        return tbl
+    story=[Paragraph('OPERATIONAL INTELLIGENCE',styles['ReportTitle']),
+           p('EXECUTIVE WORKFORCE, OPERATIONS AND SAFETY REPORT','ReportLabel'),
+           p('Scope: '+str(scope)+'  |  Generated: '+dataset['generated_at']+'  |  Source: local database','ReportSmall'),
+           Spacer(1,9)]
+    v=lambda k,kn:display(t[k]) if t[kn] else '—'
+    cards=[('WhatsApp reports',str(t['reports'])),('Groups represented',str(t['groups'])),
+           ('Before 15:00',v('changes_before','before_known')),('After 15:00',v('changes_after','after_known')),
+           ('Explicit no-shows',v('no_shows','no_shows_known')),('Calculated shortages',v('shortage','shortage_known')),
+           ('Pending nights',str(t['pending'])),('Near-miss reports',str(t['near_miss']))]
+    def kpicell(label,value):
+        return [Paragraph(X(label),styles['ReportLabel']),Paragraph(X(value),styles['Heading2'])]
+    story.append(table([[f'{lab}\n{val}' for lab,val in cards[:4]],
+                        [f'{lab}\n{val}' for lab,val in cards[4:]]],[width/4]*4,small=9,firstrow=False))
+    story.extend([Spacer(1,13),heading('Management interpretation'),
+        p('The WhatsApp message represents final actual night-shift attendance after staffing changes. '
+          'Shortages are calculated separately for each required role against the active staffing plan; '
+          'operator-entered changes and WhatsApp-reported no-shows are not deducted a second time.'),
+        p(f"Confirmed shortage calculations: {t['shortage_known']} night(s). Pending nights: {t['pending']}. "
+          f"Both change counts submitted: {t['changes_complete']} night(s). "
+          f"Explicit no-show counts: {t['no_shows_known']} night(s). Unreported values remain unknown.",'ReportSmall'),
+        heading('Workforce changes, absences and shortages')])
+    grouped={}
+    for item in e:
+        g=grouped.setdefault(item['group'],{k:0 for k,_,_ in series})
+        for k,_,_ in series:g[k]+=int(item[k] or 0)
+    ranking=sorted(grouped.items(),key=lambda kv:(-sum(kv[1].values()),kv[0].casefold()))[:12]
+    fig=Figure(figsize=(7.6,3.1 if ranking else 1.6));ax=fig.add_subplot(111)
+    if ranking:
+        y=list(range(len(ranking)));left=[0]*len(ranking)
+        for k,label,color in series:
+            values=[pair[1][k] for pair in ranking]
+            ax.barh(y,values,left=left,label=label,color=color,height=.68)
+            left=[a+b for a,b in zip(left,values)]
+        ax.set_yticks(y,[shortened(pair[0],22) for pair in ranking],fontsize=8)
+        ax.invert_yaxis();ax.legend(loc='upper center',bbox_to_anchor=(.5,1.20),ncol=4,fontsize=7,frameon=False)
+        ax.grid(axis='x',alpha=.2);ax.set_axisbelow(True)
+    else:
+        ax.text(.5,.5,'No exceptions in selected scope',ha='center',va='center',transform=ax.transAxes)
+        ax.axis('off')
+    fig.tight_layout();story.append(figimage(fig,200 if ranking else 115))
+    story.append(p('Bars show four independent event categories, not unique people. Values of zero are displayed only when '
+                   'the source is known; unreported no-show counts are not treated as confirmed zero.','ReportSmall'))
+    story.append(heading('Daily workforce exception trend'))
+    dates=sorted(set(x['date'] for x in e))[-14:]
+    fig=Figure(figsize=(7.7,2.5));ax=fig.add_subplot(111)
+    if dates:
+        positions=list(range(len(dates)));bar_width=.18
+        for index,(k,label,color) in enumerate(series):
+            vals=[sum(int(x[k] or 0) for x in e if x['date']==d) for d in dates]
+            ax.bar([q+(index-1.5)*bar_width for q in positions],vals,width=bar_width,label=label,color=color)
+        ax.set_xticks(positions,[d[5:] for d in dates],fontsize=7,rotation=35)
+        ax.legend(ncol=4,fontsize=7,frameon=False)
+        ax.grid(axis='y',alpha=.2);ax.set_axisbelow(True)
+    else:
+        ax.text(.5,.5,'No dated exception entries',ha='center',va='center',transform=ax.transAxes);ax.axis('off')
+    fig.tight_layout();story.append(figimage(fig,170))
+    story.extend([heading('Role-specific staffing requirements and gaps')])
+    totals={k:{'required':0,'present':0,'shortage':0} for k in dataset['roles']}
+    for item in e:
+        if item['shortage'] is None:continue
+        for role in item['roles']:
+            if role['role'] in totals:
+                for key in ('required','present','shortage'):totals[role['role']][key]+=int(role[key])
+    fig=Figure(figsize=(7.5,2.35));ax=fig.add_subplot(111)
+    if t['shortage_known']:
+        names=list(totals);y=list(range(len(names)))
+        ax.barh([n+.18 for n in y],[totals[k]['present'] for k in names],height=.35,color=teal,label='Actual reported')
+        ax.barh([n-.18 for n in y],[totals[k]['required'] for k in names],height=.35,color=blue,label='Required')
+        ax.set_yticks(y,names);ax.invert_yaxis();ax.legend(frameon=False,fontsize=8)
+        ax.grid(axis='x',alpha=.2);ax.set_axisbelow(True)
+    else:
+        ax.text(.5,.5,'No role-level shortage calculation available',ha='center',va='center',transform=ax.transAxes);ax.axis('off')
+    fig.tight_layout();story.append(figimage(fig,145))
+    story.append(p('Role shortages: '+', '.join(f'{name}: {v["shortage"]}' for name,v in totals.items())+'. '
+                   'A surplus in another role does not cancel a role-specific deficit.','ReportSmall'))
+    story.append(heading('Exception register — latest service-date entries'))
+    head=['Service date','Group','Before','After','No shows','Plan / Actual','Short','Status']
+    lines=[]
+    for item in e[:120]:
+        lines.append([item['date'],shortened(item['group'],24),display(item['before']),display(item['after']),
+                      display(item['no_shows']),f'{display(item["required"])} / {display(item["available"])}',
+                      display(item['shortage']),item['status']])
+    if lines:story.append(table([head]+lines,[65,94,40,40,49,75,32,57],small=6.5))
+    else:story.append(p('No exception entries in this reporting scope.'))
+    if len(e)>len(lines):story.append(p(f'Showing {len(lines)} of {len(e)} exception records; the interactive HTML includes all.','ReportSmall'))
+    story.append(heading('WhatsApp attendance and safety reporting'))
+    attendance=['T002/T003','PWT','SPL','PL']
+    source_keys=['t002_t003','pwt','spl','pl']
+    values=[sum(int(x[key] or 0) for x in r) for key in source_keys]
+    fig=Figure(figsize=(7.6,2.3));ax=fig.add_subplot(111)
+    ax.bar(attendance,values,color=[blue,teal,gold,purple])
+    ax.set_ylabel('Sum of reported message values',fontsize=8)
+    ax.grid(axis='y',alpha=.2);ax.set_axisbelow(True)
+    fig.tight_layout();story.append(figimage(fig,155))
+    story.append(p('Attendance is aggregated from WhatsApp report values; multiple reports may refer to the same people, '
+                   'so this is not a deduplicated employee count.','ReportSmall'))
+    _append_pdf_workforce_and_safety_charts(story,r,heading,p,figimage)
+    story.append(heading('Near-miss and Late metrics'))
+    fig=Figure(figsize=(7.5,2.4));ax=fig.add_subplot(111)
+    near_dates=sorted({row['day'] for row in r})[-18:]
+    if near_dates:
+        near=[sum(int(q['near_miss'] or 0) for q in r if q['day']==day) for day in near_dates]
+        late=[sum(int(q['late'] or 0) for q in r if q['day']==day) for day in near_dates]
+        ax.plot(near_dates,near,label='Near Miss',color=red,marker='o',linewidth=1.2)
+        ax.plot(near_dates,late,label='Late',color=blue,marker='s',linewidth=1.2)
+        ax.tick_params(axis='x',labelrotation=45,labelsize=7);ax.legend(frameon=False)
+        ax.grid(axis='y',alpha=.2)
+    else:
+        ax.text(.5,.5,'No WhatsApp safety reports in selected scope',ha='center',va='center',transform=ax.transAxes);ax.axis('off')
+    fig.tight_layout();story.append(figimage(fig,175))
+    story.append(p(f'Reported near-miss values: {t["near_miss"]}; Late values: {t["late"]}. '
+                   'Both are source-reported indicators, not verified incident counts.','ReportSmall'))
+    story.append(heading('Recent WhatsApp report evidence'))
+    head=['Message date','Group','T002/T003','PWT','SPL','PL','Near Miss','Late']
+    items=[]
+    for row in r[:70]:
+        items.append([row['when'][:16],shortened(row['group'],23)]+[display(row[key])
+                 for key in source_keys+['near_miss','late']])
+    if items:story.append(table([head]+items,[91,106,61,36,36,36,63,43],small=6.4))
+    else:story.append(p('No WhatsApp reports in this period.'))
+    if len(r)>len(items):story.append(p(f'Showing {len(items)} of {len(r)} received messages. The HTML export includes all.','ReportSmall'))
+    story.append(heading('Definitions and data quality'))
+    story.append(p('Before / after 15:00: counts manually saved by a signed-in coordinator. '
+                   'No-show counts are included only when explicitly stated in a WhatsApp message. '
+                   '“—” denotes unknown or not submitted; it is not zero. '
+                   'Shortage: sum across staffing roles of max(0, required minus final actual attendance). '
+                   'A night can have a known staffing shortage while its change-entry status remains incomplete. '
+                   'After-midnight WhatsApp reports can be linked to their previous service date.'))
+    doc.build(story,onFirstPage=footer,onLaterPages=footer)
+    audit('PDF_EXPORT',f'{scope} / {len(e)} exception records')
+    return path
+
+
+_HTML_REPORT_TEMPLATE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Operational Intelligence | Executive report</title>
+<style>
+:root{--bg:#0b1422;--surface:#152338;--surface2:#1b2c43;--border:#324860;--text:#f1f6fc;--muted:#b2c5da;--blue:#4d9ff8;--teal:#18c4ac;--violet:#a78bfa;--red:#fb7185;--gold:#f3c66b;--good:#40d5a0}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(120deg,#0a1220,#0e1b2b 55%,#0c1729);color:var(--text);font:14px/1.5 Inter,Segoe UI,system-ui,sans-serif}main{max-width:1450px;margin:0 auto;padding:26px 30px 65px}header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;padding:12px 0 25px;border-bottom:1px solid var(--border)}h1{font-size:30px;letter-spacing:-.03em;margin:2px 0 6px}h2{font-size:19px;letter-spacing:-.02em;margin:0 0 12px}h3{font-size:13px;color:#b3c7dd;letter-spacing:.05em;text-transform:uppercase;margin:0 0 12px}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.18em;color:var(--teal);font-weight:700}.muted,.hint{color:var(--muted)}.hint{font-size:12px}.pill{font-size:12px;border:1px solid #397565;padding:8px 12px;background:#163b35;border-radius:20px;white-space:nowrap}.controlbar{display:flex;flex-wrap:wrap;align-items:end;gap:11px;margin:21px 0 13px}.field{display:flex;flex-direction:column;gap:5px;min-width:115px}.field label{font-size:11px;color:var(--muted)}select,input,button{background:#1c3048;color:#fff;border:1px solid #47627f;padding:10px 12px;border-radius:9px;font:inherit;min-height:40px}select:focus,input:focus,button:focus{outline:2px solid var(--blue);outline-offset:2px}button{cursor:pointer;font-weight:600}button:hover{background:#29445f}.nowrap{white-space:nowrap}.scope{padding:11px 14px;border-radius:9px;background:#172c40;border-left:3px solid var(--blue);color:#c8d7e6;margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0 23px}.card,.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:0 9px 25px #0001}.card{padding:16px 18px}.card .name{font-size:11px;text-transform:uppercase;letter-spacing:.075em;color:var(--muted)}.card .value{font-size:28px;letter-spacing:-.04em;font-weight:750;margin:3px 0;color:#f3f7fc}.card .sub{font-size:11px;color:var(--muted)}.sectionhead{margin-top:32px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:end;gap:15px}.sectionhead p{margin:0;color:var(--muted)}.columns{display:grid;grid-template-columns:1.3fr 1fr;gap:13px}.panel{padding:18px;min-width:0}.legend{display:flex;flex-wrap:wrap;gap:14px;margin:7px 0 15px}.legend b{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}.hrow{display:grid;grid-template-columns:minmax(110px,180px) 1fr 52px;gap:9px;align-items:center;padding:7px 0;border-bottom:1px solid #2b4056}.hlabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.track{height:17px;display:flex;overflow:hidden;border-radius:5px;background:#293a50}.segment{height:100%;min-width:0}.hvalue{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}.empty{padding:45px 12px;text-align:center;color:var(--muted)}svg{display:block;max-width:100%}.svgwrap{overflow-x:auto}.smallnote{color:var(--muted);font-size:11px;margin-top:12px}.tablewrap{overflow-x:auto;max-height:530px;overflow-y:auto;border:1px solid var(--border);border-radius:11px}table{border-collapse:separate;border-spacing:0;min-width:940px;width:100%;font-variant-numeric:tabular-nums}th{text-align:left;position:sticky;top:0;background:#233851;color:#f5f9ff;font-size:11px;letter-spacing:.02em;z-index:1}td,th{padding:11px 12px;border-bottom:1px solid #30445d}tbody tr:nth-child(even){background:#1b2a40}tbody tr:hover{background:#244161}.risk{color:#ff9cab;font-weight:750}.ok{color:#61d6ae}.warn{color:#f2cd86}.badge{display:inline-block;padding:3px 7px;border-radius:6px;background:#2a3b50;color:#dbebf9;font-size:11px}.note{padding:13px 15px;background:#253343;border:1px solid var(--border);color:#d0deeb;border-radius:11px;margin-top:18px}footer{color:var(--muted);font-size:11px;border-top:1px solid var(--border);margin-top:35px;padding-top:17px}#reportSearch{min-width:195px}
+.gang-scroll{max-height:590px;overflow-y:auto;padding-right:8px;scrollbar-color:#45617c #19293d}
+.gang-scroll .hrow{grid-template-columns:minmax(125px,200px) 1fr 88px}
+.sharepie-layout{display:grid;grid-template-columns:minmax(175px,230px) minmax(0,1fr);gap:14px;align-items:center}
+.sharepie-svg{width:100%;height:auto;max-width:230px}
+.sharepie-legend{max-height:285px;overflow-y:auto;display:flex;flex-direction:column;gap:7px}
+.sharepie-legend .item{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text);min-width:0}
+.sharepie-legend .swatch{width:11px;height:11px;flex:none;border-radius:3px}
+.sharepie-legend .item-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.sharepie-legend .item-val{flex:none;font-variant-numeric:tabular-nums;color:var(--muted)}
+@media(max-width:650px){.sharepie-layout{grid-template-columns:1fr}.sharepie-svg{margin:0 auto}.gang-scroll .hrow{grid-template-columns:minmax(85px,130px) 1fr 58px}}
+@media(max-width:980px){.cards{grid-template-columns:repeat(2,1fr)}.columns{grid-template-columns:1fr}.hrow{grid-template-columns:minmax(90px,150px) 1fr 40px}}@media(max-width:600px){main{padding:15px}h1{font-size:24px}header{flex-direction:column}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.card{padding:12px}.card .value{font-size:24px}.controlbar{gap:8px}.field{min-width:unset;flex:1 1 42%}.sectionhead{display:block}}
+@media print{body{background:white;color:#152237}main{padding:10px}header,.panel,.card{break-inside:avoid;box-shadow:none}button,.controlbar{display:none}.panel,.card{background:white;color:#152237;border-color:#bec9d4}h2,h3,.card .value,.card .name{color:#152237}.smallnote,.muted,.hint{color:#46566b}}
+</style></head>
+<body><main>
+<header><div><div class="eyebrow">Operational Intelligence / Board Reporting</div><h1>Workforce &amp; Operations</h1><div class="muted">Interactive executive report · generated __GENERATED__</div></div><div class="pill">INTERNAL · OFFLINE SNAPSHOT</div></header>
+<div class="controlbar">
+ <div class="field"><label for="team">WhatsApp group</label><select id="team"></select></div>
+ <div class="field"><label for="period">Reporting dates</label><select id="period"><option value="all">All included dates</option><option value="7">Latest 7 included days</option><option value="14">Latest 14 included days</option><option value="30">Latest 30 included days</option><option value="custom">Custom range</option></select></div>
+ <div class="field"><label for="from">From service / report date</label><input type="date" id="from"></div>
+ <div class="field"><label for="to">To service / report date</label><input type="date" id="to"></div>
+ <div class="field"><label for="reportSearch">Find a group / record</label><input type="search" id="reportSearch" placeholder="Search table rows"></div>
+ <button id="reset">Reset filters</button><button id="download">Export filtered exceptions CSV</button>
+</div>
+<div class="scope">Exported scope: <b>__SCOPE__</b> · Dates in exception records are <b>night-shift service dates</b>, which may differ from the WhatsApp message timestamp. All charts use the embedded snapshot; this file does not update automatically.</div>
+<div class="cards" id="cards"></div>
+<div class="sectionhead"><div><div class="eyebrow">01 / Operational performance</div><h2>Staffing changes, no-shows &amp; shortages</h2><p>Independent event categories — totals are not unique employees.</p></div></div>
+<div class="columns"><section class="panel"><h3>Four-category comparison · highest activity groups</h3><div id="legend" class="legend"></div><div id="exceptionBars"></div><div class="smallnote">A blank category may mean the value was not reported. Shortages are calculated per required role from final WhatsApp attendance and staffing plans.</div></section><section class="panel"><h3>Daily exception trend · service dates</h3><div id="exceptionTrend" class="svgwrap"></div><div class="smallnote">Daily counts use service dates. Unrecorded days are not represented as confirmed zero.</div></section></div>
+<div class="columns" style="margin-top:13px"><section class="panel"><h3>Role-specific shortages · required vs present</h3><div id="roleBars"></div></section><section class="panel"><h3>Completeness &amp; reporting status</h3><div id="quality"></div></section></div>
+<div class="sectionhead"><div><div class="eyebrow">02 / Source operations</div><h2>WhatsApp attendance &amp; safety</h2><p>Reported message values, not a deduplicated headcount of unique employees.</p></div></div>
+<div class="columns"><section class="panel"><h3>Workforce role allocation · reported totals</h3><div id="attendanceBars"></div></section><section class="panel"><h3>Near-miss reporting trend · message dates</h3><div id="nearTrend" class="svgwrap"></div></section></div>
+<div class="panel" style="margin-top:13px"><h3>Gang-wise attendance · stacked horizontal comparison</h3><div id="gangAttendanceLegend" class="legend"></div><div id="gangAttendance" class="gang-scroll"></div><p class="smallnote">Reported T002/T003, PWT, SPL and PL numbers by group. Late is an attendance indicator, not another staffing role; multiple message values are not deduplicated employees.</p></div>
+<div class="columns" style="margin-top:13px"><section class="panel"><h3>Near misses percentage by group · pie chart</h3><div id="nearSharePie"></div><p class="smallnote">Share of reported near-miss values per group, not confirmed incident rates.</p></section><section class="panel"><h3>Workforce allocation percentage · pie chart</h3><div id="workforceSharePie"></div><p class="smallnote">Share of reported staffing-role values only; Late is excluded.</p></section></div>
+<div class="sectionhead"><div><div class="eyebrow">03 / Evidence registers</div><h2>Staffing exceptions by group and night</h2><p id="exceptionsCount"></p></div></div>
+<div class="panel"><div class="tablewrap"><table><thead><tr><th>Service date</th><th>Group</th><th>Before 15:00</th><th>After 15:00</th><th>No-shows</th><th>Required</th><th>Present</th><th>Shortage</th><th>Status</th></tr></thead><tbody id="exceptionsTable"></tbody></table></div><p class="smallnote">“—” means unknown or not submitted, rather than zero. Pending shortages must not be treated as confirmed staffing compliance.</p></div>
+<div class="sectionhead"><div><h2>WhatsApp report evidence</h2><p id="reportsCount"></p></div></div>
+<div class="panel"><div class="tablewrap"><table><thead><tr><th>Message date/time</th><th>Group</th><th>Sender</th><th>T002/T003</th><th>PWT</th><th>SPL</th><th>PL</th><th>Near miss</th><th>Late</th><th>No-shows reported</th></tr></thead><tbody id="reportsTable"></tbody></table></div></div>
+<div class="note"><b>Interpretation:</b> Changes before / after 15:00 are operator-entered event counts. The WhatsApp message is the final actual attendance snapshot for a night shift. Changes and no-shows must not be subtracted again from that headcount. A no-show value is shown only when explicitly stated in WhatsApp. Excess staff in one role do not cancel shortages in another role. Unknowns stay unknown.</div>
+<footer>Prepared from the locally stored Operational Intelligence database. This standalone HTML contains a point-in-time copy of report-level data and may contain internal operational information. Share only with authorised recipients. For the latest figures, re-export from the application.</footer>
+</main>
+<script>
+'use strict';
+const DATA = __PAYLOAD__;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = v => v === null || v === undefined ? '—' : Number(v).toLocaleString('en-GB');
+const COLOR={before:'#4d9ff8',after:'#18c4ac',no_shows:'#a78bfa',shortage:'#fb7185'};
+const SOURCES=[['before','Before 15:00'],['after','After 15:00'],['no_shows','No Shows'],['shortage','Shortages']];
+const uniqueDates=[...new Set([...DATA.exceptions.map(x=>x.date),...DATA.reports.map(x=>x.day)])].sort();
+const newest=uniqueDates[uniqueDates.length-1] || '';
+const names=['All Groups',...new Set([...DATA.exceptions.map(x=>x.group),...DATA.reports.map(x=>x.group)])];
+$('team').innerHTML=names.map(n=>'<option value="'+esc(n)+'">'+esc(n)+'</option>').join('');
+function minusDays(iso, n){const d=new Date(iso+'T12:00:00Z');d.setUTCDate(d.getUTCDate()-n);return d.toISOString().slice(0,10)}
+function matchesDay(d){let p=$('period').value;if(p==='custom')return (!$('from').value||d>=$('from').value)&&(!$('to').value||d<=$('to').value);if(p!=='all'&&newest)return d>=minusDays(newest,Number(p)-1)&&d<=newest;return true}
+function filtered(){let t=$('team').value.toLocaleLowerCase('en-GB');return {e:DATA.exceptions.filter(x=>(t==='all groups'||x.group.toLocaleLowerCase('en-GB')===t)&&matchesDay(x.date)),r:DATA.reports.filter(x=>(t==='all groups'||x.group.toLocaleLowerCase('en-GB')===t)&&matchesDay(x.day))}}
+function total(arr,k){return arr.reduce((s,x)=>s+Number(x[k]??0),0)}
+function card(name,value,sub){return '<div class="card"><div class="name">'+esc(name)+'</div><div class="value">'+esc(value)+'</div><div class="sub">'+esc(sub)+'</div></div>'}
+function bars(rows,metrics,max=12){if(!rows.length)return '<div class="empty">No records for the selected period.</div>';const w=rows.slice(0,max);const largest=Math.max(1,...w.map(x=>metrics.reduce((a,m)=>a+Number(x[m]??0),0)));return w.map(x=>{const sum=metrics.reduce((a,m)=>a+Number(x[m]??0),0);const seg=metrics.map(m=>{const v=Number(x[m]??0);return v?'<div class="segment" style="width:'+(v/largest*100)+'%;background:'+COLOR[m]+'" title="'+esc(m)+': '+v+'"></div>':''}).join('');return '<div class="hrow"><span class="hlabel" title="'+esc(x.group)+'">'+esc(x.group)+'</span><div class="track">'+seg+'</div><span class="hvalue">'+sum+'</span></div>'}).join('')}
+function trend(rows,fields,daysLimit=14){if(!rows.length)return '<div class="empty">No observations to chart.</div>';let d=[...new Set(rows.map(x=>x.date))].sort().slice(-daysLimit);const vals=d.map(day=>{let r=rows.filter(x=>x.date===day);return fields.map(f=>r.reduce((s,x)=>s+Number(x[f]??0),0))});const peak=Math.max(1,...vals.flat());const W=560,H=244,left=38,top=15,bottom=48,plotH=H-top-bottom, groupW=(W-left-8)/d.length, barW=Math.max(2,Math.min(12,groupW/(fields.length+1)));let svg='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Daily trends">';for(let k=0;k<=4;k++){let y=top+plotH*k/4;svg+='<line x1="'+left+'" y1="'+y+'" x2="'+(W-4)+'" y2="'+y+'" stroke="#395068" stroke-dasharray="3 3"/><text x="4" y="'+(y+4)+'" fill="#abc0d7" font-size="10">'+Math.round(peak*(4-k)/4)+'</text>'}d.forEach((day,i)=>{fields.forEach((f,j)=>{let n=vals[i][j],height=n/peak*plotH,x=left+i*groupW+4+j*barW,y=top+plotH-height;svg+='<rect x="'+x+'" y="'+y+'" width="'+(barW-1)+'" height="'+height+'" fill="'+COLOR[f]+'"><title>'+esc(day)+' '+esc(f)+': '+n+'</title></rect>'});if(d.length<18||i%2===0)svg+='<text transform="translate('+(left+i*groupW+5)+','+(H-bottom+13)+') rotate(45)" fill="#b6c8da" font-size="10">'+esc(day.slice(5))+'</text>'});return svg+'</svg>'}
+function singleTrend(rows){let byday={};rows.forEach(r=>{byday[r.day]=(byday[r.day]||0)+Number(r.near_miss??0)});const d=Object.keys(byday).sort().slice(-20);if(!d.length)return '<div class="empty">No received reports.</div>';const max=Math.max(1,...d.map(x=>byday[x]));let svg='<svg viewBox="0 0 540 228" role="img" aria-label="Near miss values by date">';d.forEach((day,i)=>{let x=30+i*25,h=byday[day]/max*160;svg+='<rect x="'+x+'" y="'+(174-h)+'" width="16" height="'+h+'" rx="3" fill="#f3c66b"><title>'+esc(day)+' · '+byday[day]+' near miss values</title></rect>';if(i%2===0)svg+='<text transform="translate('+x+',183) rotate(45)" fill="#abc0d7" font-size="10">'+esc(day.slice(5))+'</text>'});return svg+'</svg>'}
+// v3.0.0: offline Workforce/Safety chart parity. Uses the existing filtered reports.
+const GANG_FIELDS=[['t002_t003','T002/T003','#2980b9'],['pwt','PWT','#2ecc71'],['spl','SPL','#e67e22'],['pl','PL','#e74c3c'],['late','Late','#f1c40f']];
+const SHARE_COLORS=['#d35400','#2980b9','#27ae60','#8e44ad','#f39c12','#16a085','#c0392b','#597cbb','#ae7ac0','#b9a045','#7a9e49','#e18a71'];
+function sharePieHTML(items, colors, title){
+ const data=items.filter(x=>Number(x.value)>0).sort((a,b)=>b.value-a.value||a.name.localeCompare(b.name));
+ const sum=data.reduce((acc,x)=>acc+Number(x.value),0);
+ if(!sum)return '<div class="empty">No positive reported values in the selected period.</div>';
+ const cx=120,cy=120,R=93;let a=-Math.PI/2;
+ const shapes=data.map((x,i)=>{let fraction=Number(x.value)/sum,delta=2*Math.PI*fraction,color=colors[i%colors.length];
+  let shape='';if(fraction>=.999999){shape='<circle cx="120" cy="120" r="93" fill="'+color+'"/>'}
+  else{const b=a+delta,p1=[cx+R*Math.cos(a),cy+R*Math.sin(a)],p2=[cx+R*Math.cos(b),cy+R*Math.sin(b)];
+   const d='M '+cx+' '+cy+' L '+p1[0].toFixed(3)+' '+p1[1].toFixed(3)+' A '+R+' '+R+' 0 '+(delta>Math.PI?1:0)+' 1 '+p2[0].toFixed(3)+' '+p2[1].toFixed(3)+' Z';shape='<path d="'+d+'" fill="'+color+'" stroke="#152338" stroke-width="1"/>'}
+  a+=delta;return '<g>'+shape+'<title>'+esc(x.name)+' · '+x.value+' ('+(100*fraction).toFixed(1)+'%)</title></g>'
+ }).join('');
+ const legend=data.map((x,i)=>'<div class="item" title="'+esc(x.name)+'"><span class="swatch" style="background:'+colors[i%colors.length]+'"></span><span class="item-label">'+esc(x.name)+'</span><span class="item-val">'+(100*x.value/sum).toFixed(1)+'%</span></div>').join('');
+ return '<div class="sharepie-layout"><svg class="sharepie-svg" viewBox="0 0 240 240" role="img" aria-label="'+esc(title)+'">'+shapes+'</svg><div class="sharepie-legend">'+legend+'</div></div>';
+}
+function gangAttendanceHTML(rows){
+ const groups=new Map();rows.forEach(r=>{if(!groups.has(r.group))groups.set(r.group,{});let sums=groups.get(r.group);GANG_FIELDS.forEach(([key])=>sums[key]=(sums[key]||0)+Number(r[key]??0))});
+ const entries=[...groups.entries()].sort((a,b)=>a[0].localeCompare(b[0]));
+ if(!entries.length)return '<div class="empty">No WhatsApp attendance records for the selected period.</div>';
+ const peak=Math.max(1,...entries.map(([g,vals])=>GANG_FIELDS.reduce((s,[key])=>s+Number(vals[key]||0),0)));
+ return entries.map(([group,vals])=>{const staff=['t002_t003','pwt','spl','pl'].reduce((s,key)=>s+Number(vals[key]||0),0);
+  const segs=GANG_FIELDS.map(([key,label,color])=>{const v=Number(vals[key]||0);return v?'<div class="segment" style="width:'+(v/peak*100)+'%;background:'+color+'" title="'+esc(group+' · '+label+': '+v)+'"></div>':''}).join('');
+  return '<div class="hrow"><span class="hlabel" title="'+esc(group)+'">'+esc(group)+'</span><div class="track">'+segs+'</div><span class="hvalue">'+fmt(staff)+' staff</span></div>';
+ }).join('');
+}
+function refresh(){const {e,r}=filtered();const knownNo=e.filter(x=>x.no_shows!==null),knownShort=e.filter(x=>x.shortage!==null);const groups=new Set([...e.map(x=>x.group),...r.map(x=>x.group)]);const pending=e.filter(x=>x.shortage===null).length;
+$('cards').innerHTML=[card('WhatsApp reports',r.length,'Received messages in selected scope'),card('Groups represented',groups.size,'Across reports and exception entries'),card('Changes before 15:00',e.some(x=>x.before!==null)?fmt(total(e,'before')):'—',e.filter(x=>x.before!==null).length+' submitted entries'),card('Changes after 15:00',e.some(x=>x.after!==null)?fmt(total(e,'after')):'—',e.filter(x=>x.after!==null).length+' submitted entries'),card('Explicit no-shows',knownNo.length?fmt(total(knownNo,'no_shows')):'—',knownNo.length+' attendance snapshots with counts'),card('Staffing shortages',knownShort.length?fmt(total(knownShort,'shortage')):'—',knownShort.length+' calculated nights'),card('Nights awaiting review',pending,'No confirmed shortage until report/plan is valid'),card('Near-miss values',fmt(total(r,'near_miss')),'Unverified reported values')].join('');
+$('legend').innerHTML=SOURCES.map(([k,n])=>'<span><b style="background:'+COLOR[k]+'"></b>'+esc(n)+'</span>').join('');
+let group={};e.forEach(x=>{let g=group[x.group]||(group[x.group]={group:x.group,before:0,after:0,no_shows:0,shortage:0});SOURCES.forEach(([k])=>g[k]+=Number(x[k]??0))});let g=Object.values(group).sort((a,b)=>SOURCES.reduce((s,[k])=>s+b[k]-a[k],0)||a.group.localeCompare(b.group));$('exceptionBars').innerHTML=bars(g,SOURCES.map(s=>s[0]));
+$('exceptionTrend').innerHTML=trend(e,SOURCES.map(s=>s[0]));
+const roles=['T002/T003','PWT','SPL','PL'];let role=Object.fromEntries(roles.map(k=>[k,{group:k,required:0,present:0,shortage:0}]));knownShort.forEach(x=>x.roles.forEach(y=>{const v=role[y.role];if(v){v.required+=Number(y.required||0);v.present+=Number(y.present||0);v.shortage+=Number(y.shortage||0)}}));const peak=Math.max(1,...roles.map(x=>role[x].required));$('roleBars').innerHTML=knownShort.length?roles.map(k=>{const v=role[k];return '<div class="hrow"><span>'+esc(k)+'</span><div class="track"><div class="segment" style="width:'+(v.present/peak*100)+'%;background:#18c4ac"></div><div class="segment" style="width:'+(v.shortage/peak*100)+'%;background:#fb7185"></div></div><span class="hvalue">'+v.shortage+' short</span></div>'}).join('')+'<div class="smallnote">Teal = present; coral = shortage, against planned role requirements. Surplus in a role may extend the teal bar.</div>':'<div class="empty">No calculable staffing snapshots in this period.</div>';
+$('quality').innerHTML='<p><b>'+knownShort.length+'</b> nights with verified staffing calculations</p><p><b>'+pending+'</b> nights with shortages pending</p><p><b>'+e.filter(x=>x.before!==null&&x.after!==null).length+'</b> nights with both change counts entered</p><p><b>'+knownNo.length+'</b> nights with explicit WhatsApp no-show counts</p><p class="smallnote">Unknown values are not interpreted as zero. Reported dates may differ from service dates for overnight work.</p>';
+const attendance=roles.map((k,i)=>({group:k,n:total(r,['t002_t003','pwt','spl','pl'][i])}));const mx=Math.max(1,...attendance.map(x=>x.n));$('attendanceBars').innerHTML=attendance.map((x,i)=>'<div class="hrow"><span>'+esc(x.group)+'</span><div class="track"><div class="segment" style="width:'+(x.n/mx*100)+'%;background:'+['#4d9ff8','#18c4ac','#f3c66b','#a78bfa'][i]+'"></div></div><span class="hvalue">'+fmt(x.n)+'</span></div>').join('')+'<p class="smallnote">Sums of message values; do not interpret as unique people across multiple reports.</p>';
+$('nearTrend').innerHTML=singleTrend(r);
+$('gangAttendanceLegend').innerHTML=GANG_FIELDS.map(([key,label,color])=>'<span><b style="background:'+color+'"></b>'+esc(label)+'</span>').join('');
+$('gangAttendance').innerHTML=gangAttendanceHTML(r);
+const nearGroups=new Map();r.forEach(x=>nearGroups.set(x.group,(nearGroups.get(x.group)||0)+Number(x.near_miss??0)));
+$('nearSharePie').innerHTML=sharePieHTML([...nearGroups].map(([name,value])=>({name,value})),SHARE_COLORS,'Reported near-miss percentages by group');
+$('workforceSharePie').innerHTML=sharePieHTML([['t002_t003','T002/T003'],['pwt','PWT'],['spl','SPL'],['pl','PL']].map(([key,name])=>({name,value:total(r,key)})),['#4d9ff8','#18c4ac','#f3c66b','#a78bfa'],'Workforce allocation percentage by reported role');
+
+const q=$('reportSearch').value.toLocaleLowerCase('en-GB');const ex=e.filter(x=>!q||(x.group+' '+x.date+' '+x.status).toLocaleLowerCase('en-GB').includes(q));const reports=r.filter(x=>!q||(x.group+' '+x.day+' '+x.sender).toLocaleLowerCase('en-GB').includes(q));
+$('exceptionsCount').textContent=ex.length+' of '+e.length+' entries displayed. Dates follow the shift service date.';$('reportsCount').textContent=reports.length+' of '+r.length+' reports displayed.';
+$('exceptionsTable').innerHTML=ex.map(x=>'<tr><td>'+esc(x.date)+'</td><td>'+esc(x.group)+'</td><td>'+fmt(x.before)+'</td><td>'+fmt(x.after)+'</td><td>'+fmt(x.no_shows)+'</td><td>'+fmt(x.required)+'</td><td>'+fmt(x.available)+'</td><td class="'+(x.shortage>0?'risk':x.shortage===0?'ok':'warn')+'">'+fmt(x.shortage)+'</td><td><span class="badge" title="'+esc(x.reason)+'">'+esc(x.status)+'</span></td></tr>').join('')||'<tr><td colspan="9">No matching exceptions</td></tr>';
+$('reportsTable').innerHTML=reports.map(x=>'<tr><td>'+esc(x.when)+'</td><td>'+esc(x.group)+'</td><td>'+esc(x.sender)+'</td>'+['t002_t003','pwt','spl','pl','near_miss','late','no_shows'].map(k=>'<td>'+fmt(x[k])+'</td>').join('')+'</tr>').join('')||'<tr><td colspan="10">No matching reports</td></tr>';
+window.__reportRows={ex,reports};
+}
+['team','period','from','to'].forEach(id=>$(id).addEventListener('change',()=>{if(id==='from'||id==='to')$('period').value='custom';refresh()}));$('reportSearch').addEventListener('input',refresh);
+$('reset').onclick=()=>{$('team').value='All Groups';$('period').value='all';$('from').value='';$('to').value='';$('reportSearch').value='';refresh()};
+$('download').onclick=()=>{const cols=['date','group','before','after','no_shows','required','available','shortage','status','reason'];let rows=window.__reportRows?.ex||[];const csv=[cols.join(','),...rows.map(row=>cols.map(k=>'"'+String(row[k]??'').replace(/"/g,'""')+'"').join(','))].join('\r\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));link.download='staffing_exceptions_filtered.csv';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),3000)};
+refresh();
+</script></body></html>
+"""
 
 def demo_data(days=42,seed=42):
     rng=random.Random(seed);n=0
@@ -729,3 +1171,1180 @@ def demo_data(days=42,seed=42):
     return n
 
 init_db()
+
+
+# --- Staffing exceptions, planning and local account management (v3.0.0) ---
+# ---------------------------------------------------------------------------
+# OPERATIONAL EXCEPTIONS / PLANNED STAFFING (native Python + SQLite)
+# Added to the original notebook immediately after the core database cell.
+# Excel input is read-only ZIP/XML; hidden worksheets and macros are ignored.
+# ---------------------------------------------------------------------------
+import hashlib as _ex_hashlib
+import hmac as _ex_hmac
+import json as _ex_json
+import re as _ex_re
+import secrets as _ex_secrets
+import zipfile as _ex_zipfile
+import xml.etree.ElementTree as _ex_et
+from datetime import datetime as _ex_datetime, timedelta as _ex_timedelta
+from pathlib import Path as _ex_Path
+
+EX_ROLES = ('before',)  # Reuse Operator 1 account; historical Operator 2 is retained read-only.
+EX_SHIFTS = ('Shift 1', 'Shift 2', 'Shift 3')
+EX_BASIS = ('pre_adjustments', 'already_actual')
+EX_METRIC_FIELDS = {'T002/T003': 't002_t003', 'PWT': 'pwt', 'SPL': 'spl', 'PL': 'pl'}
+EX_WORKBOOK_NS = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                  'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+
+
+def init_exception_db():
+    """Independent tables; leaves existing WhatsApp reports and its fingerprint alone."""
+    with connect() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS staffing_plans (
+          group_name TEXT NOT NULL, worksheet TEXT NOT NULL,
+          effective_from TEXT NOT NULL, effective_to TEXT NOT NULL,
+          components_json TEXT NOT NULL, planned_total INTEGER NOT NULL,
+          workbook_name TEXT NOT NULL, source_cell TEXT NOT NULL,
+          imported_at TEXT NOT NULL,
+          PRIMARY KEY (group_name, worksheet, effective_from, effective_to)
+        );
+        CREATE INDEX IF NOT EXISTS idx_staffing_plans_dates
+          ON staffing_plans(group_name, effective_from, effective_to);
+
+        CREATE TABLE IF NOT EXISTS manual_staffing_plans (
+          group_name TEXT NOT NULL COLLATE NOCASE,
+          effective_from TEXT NOT NULL,
+          components_json TEXT NOT NULL,
+          planned_total INTEGER NOT NULL CHECK(planned_total > 0),
+          updated_at TEXT NOT NULL,
+          updated_by TEXT NOT NULL,
+          PRIMARY KEY (group_name,effective_from)
+        );
+        CREATE INDEX IF NOT EXISTS idx_manual_staffing_effective
+          ON manual_staffing_plans(group_name,effective_from);
+        CREATE TABLE IF NOT EXISTS manual_staffing_plan_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          changed_at TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          group_name TEXT NOT NULL,
+          effective_from TEXT NOT NULL,
+          old_state TEXT,
+          new_state TEXT
+        );
+        CREATE TABLE IF NOT EXISTS exception_users (
+          role TEXT PRIMARY KEY CHECK(role IN ('before','after')),
+          display_name TEXT NOT NULL,
+          password_salt TEXT NOT NULL, password_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS app_users (
+          username TEXT PRIMARY KEY COLLATE NOCASE,
+          display_name TEXT NOT NULL,
+          account_role TEXT NOT NULL CHECK(account_role IN ('admin','operator')),
+          password_salt TEXT NOT NULL, password_hash TEXT NOT NULL,
+          recovery_salt TEXT NOT NULL, recovery_hash TEXT,
+          failed_attempts INTEGER NOT NULL DEFAULT 0,
+          locked_until TEXT,
+          recovery_used INTEGER NOT NULL DEFAULT 0,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_login TEXT
+        );
+        CREATE TABLE IF NOT EXISTS exception_entries (
+          group_name TEXT NOT NULL, service_date TEXT NOT NULL,
+          shift_label TEXT NOT NULL CHECK(shift_label IN ('Shift 1','Shift 2','Shift 3')),
+          before_count INTEGER CHECK(before_count >= 0),
+          before_impact INTEGER,
+          after_count INTEGER CHECK(after_count >= 0),
+          after_impact INTEGER,
+          no_shows INTEGER CHECK(no_shows >= 0),
+          basis TEXT NOT NULL DEFAULT 'already_actual'
+              CHECK(basis IN ('pre_adjustments','already_actual')),
+          report_id INTEGER,
+          before_by TEXT, before_at TEXT, after_by TEXT, after_at TEXT,
+          revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+          PRIMARY KEY (group_name, service_date, shift_label)
+        );
+        CREATE INDEX IF NOT EXISTS idx_exception_date ON exception_entries(service_date);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_exception_snapshot_unique
+          ON exception_entries(report_id) WHERE report_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS exception_sync_state (
+          id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO exception_sync_state(id,revision) VALUES('plans',0);
+        CREATE TABLE IF NOT EXISTS exception_entry_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          changed_at TEXT NOT NULL, group_name TEXT NOT NULL,
+          service_date TEXT NOT NULL, shift_label TEXT NOT NULL,
+          actor_role TEXT NOT NULL, actor_name TEXT NOT NULL,
+          old_state TEXT NOT NULL, new_state TEXT NOT NULL
+        );
+        ''')
+
+
+def exception_users_ready():
+    # Legacy Operator 1 login becomes the sole change-entry login.
+    with connect() as c:
+        return c.execute("SELECT 1 FROM exception_users WHERE role='before'").fetchone() is not None
+
+
+def configure_exception_users(name, pin):
+    # Create one operator login; preserve legacy accounts and history.
+    name, pin = str(name).strip(), str(pin)
+    if not name or len(name) > 100:
+        raise ValueError('Enter an operator name (maximum 100 characters).')
+    if not 6 <= len(pin) <= 128:
+        raise ValueError('Use a passcode of 6 to 128 characters.')
+    salt = _ex_secrets.token_bytes(16)
+    digest = _ex_hashlib.pbkdf2_hmac('sha256', pin.encode('utf-8'), salt, 230000)
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if c.execute("SELECT 1 FROM exception_users WHERE role='before'").fetchone():
+            raise ValueError('Change-entry login already exists. Use its existing passcode.')
+        c.execute('''INSERT INTO exception_users(role,display_name,password_salt,password_hash,created_at)
+          VALUES('before',?,?,?,?)''',(name,salt.hex(),digest.hex(),stamp()))
+    audit('CHANGE_OPERATOR_SETUP', 'Single changes operator account configured')
+
+
+def authenticate_exception_user(role, pin):
+    if role not in EX_ROLES:
+        raise ValueError('Unknown operator role.')
+    with connect() as c:
+        row = c.execute('SELECT * FROM exception_users WHERE role=?', (role,)).fetchone()
+    if row is None:
+        raise PermissionError('The exception operator accounts are not configured.')
+    digest = _ex_hashlib.pbkdf2_hmac('sha256', str(pin).encode('utf-8'),
+                                     bytes.fromhex(row['password_salt']), 230000)
+    if not _ex_hmac.compare_digest(digest, bytes.fromhex(row['password_hash'])):
+        raise PermissionError('Incorrect passcode.')
+    return row['display_name']
+
+
+# ===========================================================================
+# Local multi-user exception entry (does not require an external API).
+# One-time recovery codes are revealed only at account creation/rotation.
+# This is a local-workstation access control, not a remote authentication server.
+# ===========================================================================
+from datetime import timezone as _ex_timezone
+
+_PASSWORD_ITERATIONS = 260000
+# Volatile per-process sessions: tokens are never stored in SQLite or settings.json.
+_APP_SESSIONS = {}
+_SESSION_IDLE_MINUTES = 12 * 60
+
+
+def app_session_info(token):
+    info = _APP_SESSIONS.get(str(token))
+    if not info:
+        raise PermissionError('Your session has expired. Sign in again.')
+    now = _ex_datetime.now(_ex_timezone.utc)
+    if (now-info['last_used']).total_seconds() > _SESSION_IDLE_MINUTES*60:
+        _APP_SESSIONS.pop(str(token),None)
+        raise PermissionError('Session expired. Sign in again.')
+    with connect() as c:
+        row = c.execute('SELECT account_role,enabled,display_name FROM app_users WHERE username=?',
+                        (info['username'],)).fetchone()
+    if not row or not row['enabled']:
+        _APP_SESSIONS.pop(str(token),None)
+        raise PermissionError('Account disabled or unavailable. Sign in again.')
+    info['last_used'] = now
+    return {'username':info['username'],'display_name':row['display_name'],
+            'role':row['account_role'],'token':str(token)}
+
+
+def revoke_app_session(token):
+    _APP_SESSIONS.pop(str(token),None)
+
+
+def _revoke_user_sessions(username):
+    for key,item in list(_APP_SESSIONS.items()):
+        if item['username'].casefold()==str(username).casefold():
+            _APP_SESSIONS.pop(key,None)
+
+_USERNAME_PATTERN = _ex_re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{2,31}\Z")
+
+
+def _validate_username(name):
+    name = str(name).strip()
+    if not _USERNAME_PATTERN.fullmatch(name):
+        raise ValueError('Username must be 3–32 characters: letters, numbers, dots, dashes or underscores.')
+    return name
+
+
+def _validate_password(password):
+    password = str(password)
+    if len(password) < 12 or len(password) > 128:
+        raise ValueError('Password must be 12–128 characters long.')
+    if password.strip() != password:
+        raise ValueError('Password cannot begin or end with spaces.')
+    return password
+
+
+def _pbkdf2(value, salt):
+    return _ex_hashlib.pbkdf2_hmac('sha256', value.encode('utf-8'), salt, _PASSWORD_ITERATIONS).hex()
+
+
+def _new_credential(value):
+    salt = _ex_secrets.token_bytes(16)
+    return salt.hex(), _pbkdf2(value, salt)
+
+
+def _new_recovery():
+    code = _ex_secrets.token_hex(20)  # 160-bit random, kept out of logs.
+    salt, digest = _new_credential(code)
+    return code, salt, digest
+
+
+def _normalise_recovery(code):
+    return _ex_re.sub(r'[\s-]+','',str(code)).lower()
+
+
+def app_users_ready():
+    with connect() as c:
+        return bool(c.execute('SELECT 1 FROM app_users LIMIT 1').fetchone())
+
+
+def legacy_operator_migration_required():
+    with connect() as c:
+        old = c.execute("SELECT 1 FROM exception_users WHERE role='before'").fetchone()
+        new = c.execute('SELECT 1 FROM app_users LIMIT 1').fetchone()
+    return bool(old and not new)
+
+
+def _make_app_user(c, username, display_name, role, password):
+    username = _validate_username(username)
+    display_name = str(display_name).strip()
+    if not display_name or len(display_name)>100:
+        raise ValueError('Enter a display name up to 100 characters.')
+    if role not in ('admin','operator'):
+        raise ValueError('Account role must be administrator or operator.')
+    password = _validate_password(password)
+    ps, ph = _new_credential(password)
+    code, rs, rh = _new_recovery()
+    now = stamp()
+    c.execute('''INSERT INTO app_users
+      (username,display_name,account_role,password_salt,password_hash,
+       recovery_salt,recovery_hash,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?)''',
+       (username,display_name,role,ps,ph,rs,rh,now,now))
+    return code
+
+
+def bootstrap_admin_account(username, display_name, password, legacy_passcode=None):
+    '''First-run administration; legacy Operator 1 passcode is required on upgrade.'''
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if c.execute('SELECT 1 FROM app_users LIMIT 1').fetchone():
+            raise PermissionError('An administrator already exists. Please sign in.')
+        legacy = c.execute("SELECT * FROM exception_users WHERE role='before'").fetchone()
+        if legacy:
+            digest = _ex_hashlib.pbkdf2_hmac('sha256', str(legacy_passcode or '').encode('utf-8'),
+                                     bytes.fromhex(legacy['password_salt']),230000)
+            if not _ex_hmac.compare_digest(digest,bytes.fromhex(legacy['password_hash'])):
+                raise PermissionError('The existing Operator 1 passcode is required to upgrade accounts.')
+        code = _make_app_user(c,username,display_name,'admin',password)
+    audit('APP_ADMIN_BOOTSTRAP','Administrator account created; credentials not logged')
+    return code
+
+
+def _require_admin(c, actor):
+    username = app_session_info(actor)['username']
+    current = c.execute('SELECT account_role,enabled FROM app_users WHERE username=?', (username,)).fetchone()
+    if not current or not current['enabled'] or current['account_role']!='admin':
+        raise PermissionError('An administrator account is required.')
+
+
+def list_app_users():
+    with connect() as c:
+        return [dict(x) for x in c.execute('''SELECT username,display_name,account_role,enabled,
+             last_login,created_at FROM app_users ORDER BY account_role,username COLLATE NOCASE''')]
+
+
+def create_app_user(actor, username, display_name, role, password):
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        _require_admin(c,actor)
+        code = _make_app_user(c,username,display_name,role,password)
+    audit('APP_USER_CREATED',f'{app_session_info(actor)["username"]} added {username} ({role})')
+    return code
+
+
+def authenticate_app_user(username,password):
+    name = str(username).strip()
+    now = _ex_datetime.now(_ex_timezone.utc)
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT * FROM app_users WHERE username=?', (name,)).fetchone()
+        if not row:
+            # Similar computational work for an unknown username.
+            _pbkdf2(str(password),bytes(16))
+            raise PermissionError('Invalid username or password.')
+        if not row['enabled']:
+            raise PermissionError('Account disabled. Contact an administrator.')
+        if row['locked_until']:
+            try: locked = _ex_datetime.fromisoformat(row['locked_until'])
+            except ValueError: locked = now
+            if locked>now:
+                raise PermissionError('Too many sign-in attempts. Try again in 15 minutes or use recovery.')
+        actual = _pbkdf2(str(password),bytes.fromhex(row['password_salt']))
+        if not _ex_hmac.compare_digest(actual,row['password_hash']):
+            attempts=int(row['failed_attempts'])+1
+            until=(now+_ex_timedelta(minutes=15)).isoformat() if attempts>=5 else None
+            c.execute('UPDATE app_users SET failed_attempts=?,locked_until=? WHERE username=?',
+                      (attempts,until,name))
+            raise_permission=True
+        else:
+            c.execute('''UPDATE app_users SET failed_attempts=0,locked_until=NULL,
+                      last_login=? WHERE username=?''',(now.isoformat(),name))
+            raise_permission=False
+            session={'username':row['username'],'display_name':row['display_name'],
+                     'role':row['account_role']}
+    if raise_permission:
+        raise PermissionError('Invalid username or password.')
+    token=_ex_secrets.token_urlsafe(32)
+    _APP_SESSIONS[token]={'username':session['username'],'last_used':now}
+    session['token']=token
+    audit('APP_USER_SIGN_IN',f"{session['username']} signed in to Exceptions")
+    return session
+
+
+def recover_app_password(username, recovery_code, new_password):
+    '''Single-use, offline recovery. A successful reset rotates the recovery code.'''
+    new_password=_validate_password(new_password)
+    code=_normalise_recovery(recovery_code)
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute('SELECT * FROM app_users WHERE username=?',(str(username).strip(),)).fetchone()
+        if not row or not row['enabled'] or not row['recovery_hash'] or row['recovery_used']:
+            raise PermissionError('Recovery details are invalid. Contact an administrator.')
+        digest=_pbkdf2(code,bytes.fromhex(row['recovery_salt']))
+        if not _ex_hmac.compare_digest(digest,row['recovery_hash']):
+            raise PermissionError('Recovery details are invalid. Contact an administrator.')
+        ps,ph=_new_credential(new_password)
+        next_code,rs,rh=_new_recovery()
+        c.execute('''UPDATE app_users SET password_salt=?,password_hash=?,
+            recovery_salt=?,recovery_hash=?,recovery_used=0,
+            failed_attempts=0,locked_until=NULL,updated_at=? WHERE username=?''',
+            (ps,ph,rs,rh,stamp(),row['username']))
+    _revoke_user_sessions(row['username'])
+    audit('APP_PASSWORD_RECOVERED',f"Offline recovery used for {row['username']}")
+    return next_code
+
+
+def rotate_user_recovery_code(actor, username):
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        _require_admin(c,actor)
+        row=c.execute('SELECT username FROM app_users WHERE username=?',(username,)).fetchone()
+        if not row:raise ValueError('Unknown user account.')
+        code,rs,rh=_new_recovery()
+        c.execute('''UPDATE app_users SET recovery_salt=?,recovery_hash=?,
+                    recovery_used=0,updated_at=? WHERE username=?''',
+                    (rs,rh,stamp(),row['username']))
+    audit('APP_RECOVERY_ROTATED',f'{app_session_info(actor)["username"]} regenerated recovery for {username}')
+    return code
+
+
+def set_app_user_enabled(actor, username, enabled):
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        _require_admin(c,actor)
+        row=c.execute('SELECT username,account_role,enabled FROM app_users WHERE username=?',(username,)).fetchone()
+        if not row:raise ValueError('Unknown account.')
+        if row['username'].casefold()==str(actor).casefold() and not enabled:
+            raise ValueError('You cannot disable your own administrator account.')
+        if not enabled and row['account_role']=='admin':
+            admins=c.execute("SELECT COUNT(*) FROM app_users WHERE enabled=1 AND account_role='admin'").fetchone()[0]
+            if admins<=1:raise ValueError('At least one enabled administrator must remain.')
+        c.execute('UPDATE app_users SET enabled=?,updated_at=? WHERE username=?',
+            (1 if enabled else 0,stamp(),row['username']))
+    if not enabled:_revoke_user_sessions(username)
+    audit('APP_USER_STATUS',f"{app_session_info(actor)['username']} {'enabled' if enabled else 'disabled'} {username}")
+
+
+def link_final_attendance_as_user(session_token, group, service_date, report_id, expected_revision):
+    principal=app_session_info(session_token)
+    return link_final_attendance(principal['username'],group,service_date,
+                                 'Shift 1',expected_revision,report_id)
+
+
+def bulk_save_change_counts(actor, service_date, updates):
+    '''Atomic multi-group changes. updates: [{group,revision,before?,after?}, ...].
+
+    Unspecified stages remain NULL/unmodified; explicit zero means submitted zero.
+    Any stale revision or invalid count aborts the *entire* batch.
+    '''
+    actor=app_session_info(actor)['username']
+    day=parse_date(service_date).isoformat()
+    active={x['name'].casefold() for x in group_registry() if x['enabled']}
+    if not isinstance(updates,list) or len(updates)>1000:
+        raise ValueError('Submit a list of up to 1000 group updates.')
+    checked=[];seen=set()
+    for item in updates:
+        group=str(item.get('group','')).strip()
+        if group.casefold() in seen:raise ValueError('Duplicate group in batch: '+group)
+        seen.add(group.casefold())
+        if group.casefold() not in active:raise ValueError('Inactive or unknown group: '+group)
+        revision=item.get('revision')
+        if type(revision) is not int or revision<0:raise ValueError('Invalid revision for '+group)
+        fields={}
+        for stage in ('before','after'):
+            if stage in item:
+                fields[stage]=_ex_validate_nonneg(item[stage],stage+' 15:00')
+        if fields:checked.append((group,revision,fields))
+    if not checked:return 0
+    now=stamp()
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        changes=[]
+        for group,expected,fields in checked:
+            previous_row=c.execute('''SELECT * FROM exception_entries
+                WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label='Shift 1' ''',
+                (group,day)).fetchone()
+            previous=dict(previous_row) if previous_row else {}
+            current_revision=previous.get('revision',0)
+            if expected!=current_revision:
+                raise RuntimeError('Another user has changed '+group+' since you loaded it. Reload before saving.')
+            next_fields={}
+            for stage,value in fields.items():
+                col=stage+'_count'
+                if previous.get(col)!=value:
+                    next_fields[col]=value
+                    next_fields[stage+'_by']=actor
+                    next_fields[stage+'_at']=now
+            if not next_fields:continue
+            if not previous_row:
+                c.execute('''INSERT INTO exception_entries(group_name,service_date,shift_label,updated_at)
+                     VALUES(?,?,'Shift 1',?)''',(group,day,now))
+            assignments=','.join(k+'=?' for k in next_fields)
+            values=list(next_fields.values())+[now,group,day,current_revision]
+            updated=c.execute('''UPDATE exception_entries SET '''+assignments+''',
+                basis='already_actual',updated_at=?,revision=revision+1
+                WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label='Shift 1'
+                AND revision=?''', values)
+            if updated.rowcount != 1:
+                raise RuntimeError('Concurrent edit detected for '+group)
+            new=dict(c.execute('''SELECT * FROM exception_entries WHERE
+                group_name=? COLLATE NOCASE AND service_date=? AND shift_label='Shift 1' ''',
+                (group,day)).fetchone())
+            c.execute('''INSERT INTO exception_entry_audit
+              (changed_at,group_name,service_date,shift_label,actor_role,actor_name,old_state,new_state)
+              VALUES(?,?,?,?,?,?,?,?)''',
+              (now,group,day,'Shift 1','batch_changes',actor,
+               _ex_json.dumps(previous,sort_keys=True),_ex_json.dumps(new,sort_keys=True)))
+            changes.append(group)
+    audit('CHANGES_BATCH_SAVED',f'{actor} submitted {len(changes)} group(s) for {day}')
+    return len(changes)
+
+
+def _ex_xlsx_rows(workbook_path):
+    """Read visible worksheet cell values without loading/executing VBA macros."""
+    from posixpath import normpath as _normpath
+    path = _ex_Path(workbook_path)
+    if path.suffix.lower() not in ('.xlsm', '.xlsx'):
+        raise ValueError('Choose a .xlsm or .xlsx staffing tracker.')
+    with _ex_zipfile.ZipFile(path) as z:
+        all_names = set(z.namelist())
+        shared = []
+        if 'xl/sharedStrings.xml' in all_names:
+            root = _ex_et.fromstring(z.read('xl/sharedStrings.xml'))
+            shared = [''.join(n.text or '' for n in item.iter()
+                              if n.tag.endswith('}t'))
+                      for item in root.findall('m:si', EX_WORKBOOK_NS)]
+        workbook = _ex_et.fromstring(z.read('xl/workbook.xml'))
+        relroot = _ex_et.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+        relmap = {n.attrib['Id']: n.attrib['Target'] for n in relroot}
+        for sh in workbook.findall('m:sheets/m:sheet', EX_WORKBOOK_NS):
+            if sh.attrib.get('state', 'visible') != 'visible':
+                continue
+            name = sh.attrib['name']
+            target = relmap[sh.attrib['{' + EX_WORKBOOK_NS['r'] + '}id']]
+            xml_path = _normpath(target.lstrip('/') if target.startswith('/xl/') else
+                                 ('xl/' + target) if not target.startswith('xl/') else target)
+            if xml_path not in all_names:
+                continue
+            root = _ex_et.fromstring(z.read(xml_path))
+            rows = {}
+            for item in root.findall('.//m:sheetData/m:row/m:c', EX_WORKBOOK_NS):
+                match = _ex_re.match(r'^([A-Z]+)(\d+)$', item.attrib.get('r', ''))
+                if not match:
+                    continue
+                col, r = match.group(1), int(match.group(2))
+                v = item.find('m:v', EX_WORKBOOK_NS)
+                inline = item.find('m:is', EX_WORKBOOK_NS)
+                value = v.text if v is not None else None
+                if item.attrib.get('t') == 's' and value is not None:
+                    value = shared[int(value)]
+                elif item.attrib.get('t') == 'inlineStr' and inline is not None:
+                    value = ''.join(inline.itertext())
+                if value is not None:
+                    rows.setdefault(r, {})[col] = value
+            yield name, rows
+
+
+def _ex_col_num(col):
+    n = 0
+    for c in col:
+        n = n * 26 + (ord(c) - 64)
+    return n
+
+
+def _ex_as_count(val):
+    try:
+        numeric = float(val)
+        return int(numeric) if numeric.is_integer() and 0 <= numeric <= 100000 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _ex_date_from_serial(val):
+    try:
+        v = float(val)
+        if 35000 <= v < 90000:
+            return (_ex_datetime(1899, 12, 30) + _ex_timedelta(days=v)).date().isoformat()
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+def _ex_normalise_component(title):
+    label = ' '.join(str(title or '').strip().upper().split())
+    if 'T002' in label and 'T003' in label:
+        return 'T002/T003'
+    if label == 'PWT':
+        return 'PWT'
+    if label in ("SPL'S", 'SPL', 'SPLS'):
+        return 'SPL'
+    if label == 'PL':
+        return 'PL'
+    return label
+
+
+def inspect_visible_staffing_plans(workbook_path):
+    """Read planned staffing ONLY from numeric C cells of each visible PLANNED block.
+
+    Each worksheet block has the gang title in column A, a 'PLANNED' header,
+    C='SHIFT', and labelled staffing component rows in B/C. Its daily headers
+    establish the dates for which the baseline is applicable. Blank C means
+    unknown, NEVER zero; hidden worksheets are always ignored.
+    """
+    result, warnings = [], []
+    for sheet, rows in _ex_xlsx_rows(workbook_path):
+        for r in sorted(rows):
+            header = rows[r]
+            if str(header.get('A') or '').strip().upper() != 'PLANNED' or str(header.get('C') or '').strip().upper() != 'SHIFT':
+                continue
+            group = str(rows.get(r - 2, {}).get('A') or '').strip()
+            if not group:
+                warnings.append(f'{sheet}!A{r-2}: missing gang name')
+                continue
+            dates = []
+            for col, val in header.items():
+                if col not in ('A', 'B', 'C') and 4 <= _ex_col_num(col) <= 37:
+                    day = _ex_date_from_serial(val)
+                    if day:
+                        dates.append(day)
+            if not dates:
+                warnings.append(f'{sheet}!D{r}: no dated shift columns')
+                continue
+            parts = {}
+            source_cells = []
+            for rr in range(r + 1, r + 12):
+                line = rows.get(rr, {})
+                raw_label = str(line.get('B') or '').strip()
+                if not raw_label or any(key in raw_label.casefold() for key in
+                                        ('change', 'no show', 'shortage', 'late', 'near miss')):
+                    continue
+                val = _ex_as_count(line.get('C'))
+                if val is None:
+                    continue
+                name = _ex_normalise_component(raw_label)
+                parts[name] = parts.get(name, 0) + val
+                source_cells.append(f'C{rr}')
+            if not parts:
+                # A blank planned team is not a zero-staffing plan.
+                continue
+            result.append(dict(group_name=group, worksheet=sheet,
+                               effective_from=min(dates), effective_to=max(dates),
+                               components=parts, planned_total=sum(parts.values()),
+                               source_cell=', '.join(source_cells)))
+    return result, warnings
+
+
+def import_visible_staffing_plans(workbook_path):
+    plans, warnings = inspect_visible_staffing_plans(workbook_path)
+    if not plans:
+        raise ValueError('No visible worksheets with dated planned staffing in column C were found.')
+    now = stamp()
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        for p in plans:
+            c.execute('''INSERT INTO staffing_plans
+                (group_name,worksheet,effective_from,effective_to,components_json,
+                 planned_total,workbook_name,source_cell,imported_at)
+                 VALUES(?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT(group_name,worksheet,effective_from,effective_to)
+                 DO UPDATE SET components_json=excluded.components_json,
+                   planned_total=excluded.planned_total,
+                   workbook_name=excluded.workbook_name,
+                   source_cell=excluded.source_cell,
+                   imported_at=excluded.imported_at''',
+                  (p['group_name'], p['worksheet'], p['effective_from'],
+                   p['effective_to'], _ex_json.dumps(p['components'], sort_keys=True),
+                   p['planned_total'], _ex_Path(workbook_path).name, p['source_cell'], now))
+    audit('VISIBLE_PLANS_IMPORTED',
+          f'{_ex_Path(workbook_path).name}: {len(plans)} nonblank plans, {len(warnings)} notices')
+    return plans, warnings
+
+
+
+def manual_plan_versions(group):
+    """Versioned, locally configured requirements for one WhatsApp group."""
+    with connect() as c:
+        rows = c.execute('''SELECT * FROM manual_staffing_plans
+            WHERE group_name=? COLLATE NOCASE ORDER BY effective_from DESC''', (group,)).fetchall()
+    return [{**dict(row), 'components': _ex_json.loads(row['components_json'])} for row in rows]
+
+
+def save_manual_staffing_plan(group, effective_from, components, actor='Settings'):
+    """Save a date-effective, auditable plan; zero means a role is not required.
+
+    A newer start date supersedes the preceding plan but does not rewrite
+    historical staffing requirements. Workbook plans remain a dated fallback.
+    """
+    group = validated_group_title(group)
+    registered = {r['name'].casefold() for r in group_registry()}
+    if group.casefold() not in registered:
+        raise ValueError('Save this WhatsApp group in Settings before configuring its staffing plan.')
+    day = parse_date(effective_from).isoformat()
+    if set(components) != set(EX_METRIC_FIELDS):
+        raise ValueError('Provide exactly T002/T003, PWT, SPL and PL requirements.')
+    clean = {}
+    for role in EX_METRIC_FIELDS:
+        raw = components[role]
+        if isinstance(raw, bool) or (not isinstance(raw, int) and
+            (not isinstance(raw, str) or not raw.strip().isascii() or not raw.strip().isdecimal())):
+            raise ValueError(f'{role}: enter a whole number between 0 and 10000.')
+        amount = int(raw)
+        if amount < 0 or amount > 10000:
+            raise ValueError(f'{role}: enter a whole number between 0 and 10000.')
+        clean[role] = amount
+    total = sum(clean.values())
+    if total == 0:
+        raise ValueError('The required total must be above zero. Use 0 for individual roles that are not required.')
+    now = stamp()
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        old = c.execute('''SELECT * FROM manual_staffing_plans
+            WHERE group_name=? COLLATE NOCASE AND effective_from=?''', (group,day)).fetchone()
+        old_json = _ex_json.dumps(dict(old), sort_keys=True) if old else None
+        new_json = _ex_json.dumps(clean, sort_keys=True)
+        if old:
+            c.execute('''UPDATE manual_staffing_plans
+              SET components_json=?, planned_total=?, updated_at=?, updated_by=?
+              WHERE group_name=? COLLATE NOCASE AND effective_from=?''',
+              (new_json,total,now,str(actor),group,day))
+        else:
+            c.execute('''INSERT INTO manual_staffing_plans
+              (group_name,effective_from,components_json,planned_total,updated_at,updated_by)
+              VALUES(?,?,?,?,?,?)''',(group,day,new_json,total,now,str(actor)))
+        c.execute('''INSERT INTO manual_staffing_plan_audit
+          (changed_at,actor,operation,group_name,effective_from,old_state,new_state)
+          VALUES(?,?,?,?,?,?,?)''',
+          (now,str(actor),'UPDATED' if old else 'CREATED',group,day,old_json,new_json))
+        c.execute("UPDATE exception_sync_state SET revision=revision+1 WHERE id='plans'")
+    audit('MANUAL_PLAN_SAVED', f'{group} {day}: {total} planned (by {actor})')
+    return {'group_name':group,'effective_from':day,'components':clean,'planned_total':total}
+
+
+def delete_manual_staffing_plan(group, effective_from, actor='Settings'):
+    """Delete only the exact manual version selected, never imported Excel plans."""
+    day = parse_date(effective_from).isoformat()
+    now = stamp()
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        old = c.execute('''SELECT * FROM manual_staffing_plans
+            WHERE group_name=? COLLATE NOCASE AND effective_from=?''',(group,day)).fetchone()
+        if old is None:
+            raise ValueError('No manually saved plan starts on the selected date.')
+        c.execute('''DELETE FROM manual_staffing_plans
+            WHERE group_name=? COLLATE NOCASE AND effective_from=?''',(group,day))
+        c.execute('''INSERT INTO manual_staffing_plan_audit
+          (changed_at,actor,operation,group_name,effective_from,old_state,new_state)
+          VALUES(?,?,?,?,?,?,?)''',
+          (now,str(actor),'DELETED',group,day,_ex_json.dumps(dict(old),sort_keys=True),None))
+        c.execute("UPDATE exception_sync_state SET revision=revision+1 WHERE id='plans'")
+    audit('MANUAL_PLAN_DELETED', f'{group} {day} by {actor}')
+
+
+def exception_plan(group, service_date):
+    """Manual dated plans take priority; fall back to visible Excel worksheets."""
+    day = parse_date(service_date).isoformat()
+    with connect() as c:
+        manual = c.execute('''SELECT * FROM manual_staffing_plans
+            WHERE group_name=? COLLATE NOCASE AND effective_from<=?
+            ORDER BY effective_from DESC LIMIT 1''',(group,day)).fetchone()
+        if manual is not None:
+            row = dict(manual)
+            row['components'] = _ex_json.loads(row['components_json'])
+            row['worksheet'] = 'Settings / manual plan'
+            row['effective_to'] = 'Until superseded'
+            row['source'] = 'Manual staffing planner'
+            return row, ''
+        matches = [dict(r) for r in c.execute('''
+            SELECT * FROM staffing_plans WHERE group_name=? COLLATE NOCASE
+              AND effective_from<=? AND effective_to>=?''',
+            (group, day, day))]
+    if not matches:
+        return None, 'No staffing plan for this group/date. Use Settings → Manage Staffing Plans or import a current tracker.'
+    # Never guess between two worksheets or overlapping Excel sources.
+    if len(matches) != 1:
+        return None, 'Multiple overlapping Excel planning sources. Set a manual plan in Settings to resolve this date.'
+    row = matches[0]
+    row['components'] = _ex_json.loads(row['components_json'])
+    row['source'] = 'Visible Excel worksheet'
+    unsupported = [v for v in row['components'] if v not in EX_METRIC_FIELDS]
+    if unsupported:
+        return None, f"Plan includes roles not captured by WhatsApp ({', '.join(unsupported)}). Set a manual plan with supported roles."
+    return row, ''
+
+
+def exception_reports(group, service_date):
+    # Include next-morning reports for explicit night-shift selection only.
+    day = parse_date(service_date)
+    next_day = day + _ex_timedelta(days=1)
+    with connect() as c:
+        return [dict(r) for r in c.execute('''
+           SELECT id,event_at,group_name,t002_t003,pwt,spl,pl,no_shows
+           FROM reports WHERE group_name=? COLLATE NOCASE
+           AND event_at>=? AND event_at<?
+           AND (t002_t003 IS NOT NULL OR pwt IS NOT NULL
+                OR spl IS NOT NULL OR pl IS NOT NULL)
+           ORDER BY event_at DESC,id DESC''',
+           (group, day.isoformat()+'T00:00:00', next_day.isoformat()+'T08:00:00'))]
+
+
+def whatsapp_no_shows_for_snapshot(group, service_date, snapshot):
+    # Use explicit count only; ambiguous multiple WhatsApp updates stay unknown.
+    if snapshot.get('no_shows') is not None:
+        return snapshot['no_shows']
+    report_day = snapshot['event_at'][:10]
+    service_day = parse_date(service_date).isoformat()
+    with connect() as c:
+        others = [r[0] for r in c.execute('''SELECT no_shows FROM reports
+          WHERE group_name=? COLLATE NOCASE
+            AND substr(event_at,1,10) IN (?,?)
+            AND no_shows IS NOT NULL''', (group, report_day, service_day))]
+    return others[0] if len(others)==1 else None
+
+
+def exception_entry(group, service_date, shift_label='Shift 1'):
+    with connect() as c:
+        found = c.execute('''SELECT * FROM exception_entries
+          WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label=?''',
+          (group, service_date, shift_label)).fetchone()
+    return dict(found) if found else None
+
+
+def _ex_validate_nonneg(n, field):
+    if isinstance(n, bool) or not str(n).strip().isdigit() or len(str(n).strip()) > 6:
+        raise ValueError(f'{field} must be a non-negative whole number.')
+    value = int(n)
+    if value > 100000:
+        raise ValueError(f'{field} cannot exceed 100000.')
+    return value
+
+
+def _ex_validate_signed(n, field):
+    val = str(n).strip()
+    if not _ex_re.fullmatch(r'[+-]?\d{1,6}', val):
+        raise ValueError(f'{field} must be a signed whole number, e.g. -2, 0, +1.')
+    value = int(val)
+    if abs(value) > 100000:
+        raise ValueError(f'{field} magnitude cannot exceed 100000.')
+    return value
+
+
+def save_change_counts(actor, group, service_date, shift_label,
+                       expected_revision, before_count, after_count, report_id=None):
+    # Single operator edits both change counts; no-show history is untouched.
+    if not str(actor).strip() or len(str(actor)) > 100:
+        raise PermissionError('Sign in to record changes.')
+    group = str(group).strip()
+    registered = {x['name'].casefold() for x in group_registry() if x['enabled']}
+    if group.casefold() not in registered:
+        raise ValueError('Group is not active. Enable it under Settings → Group Registry.')
+    day = parse_date(service_date).isoformat()
+    if shift_label not in EX_SHIFTS:
+        raise ValueError('Invalid shift.')
+    if not isinstance(expected_revision,int) or expected_revision < 0:
+        raise ValueError('Invalid entry revision.')
+    before = _ex_validate_nonneg(before_count, 'Changes before 15:00')
+    after = _ex_validate_nonneg(after_count, 'Changes after 15:00')
+    if report_id not in (None,''):
+        try: report_id = int(report_id)
+        except (ValueError,TypeError): raise ValueError('Invalid WhatsApp report.')
+        if report_id not in {x['id'] for x in exception_reports(group, day)}:
+            raise ValueError('Selected WhatsApp report is not associated with this group/service window.')
+    else:
+        report_id = None
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if report_id is not None:
+            duplicate = c.execute('''SELECT shift_label,service_date FROM exception_entries
+                WHERE report_id=? AND NOT (group_name=? COLLATE NOCASE
+                AND service_date=? AND shift_label=?)''',
+                (report_id,group,day,shift_label)).fetchone()
+            if duplicate:
+                raise ValueError('This WhatsApp report is already linked to another shift: '
+                                 + duplicate['service_date'] + ' / ' + duplicate['shift_label'])
+        old = c.execute('''SELECT * FROM exception_entries WHERE group_name=? COLLATE NOCASE
+             AND service_date=? AND shift_label=?''', (group,day,shift_label)).fetchone()
+        old_data = dict(old) if old else {}
+        revision = int(old_data.get('revision', 0))
+        if expected_revision != revision:
+            raise RuntimeError('This entry has changed since you loaded it. Reload before submitting.')
+        now = stamp()
+        if old is None:
+            c.execute('''INSERT INTO exception_entries(group_name,service_date,shift_label,updated_at)
+                         VALUES(?,?,?,?)''',(group,day,shift_label,now))
+        changed = c.execute('''UPDATE exception_entries SET before_count=?, after_count=?,
+             before_impact=NULL, after_impact=NULL, basis='already_actual',report_id=?,
+             before_by=?, before_at=?, after_by=?, after_at=?,
+             updated_at=?, revision=revision+1
+             WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label=? AND revision=?''',
+             (before,after,report_id,actor,now,actor,now,now,group,day,shift_label,revision))
+        if changed.rowcount != 1:
+            raise RuntimeError('Concurrent update detected. Reload before submitting.')
+        new = dict(c.execute('''SELECT * FROM exception_entries WHERE group_name=? COLLATE NOCASE
+          AND service_date=? AND shift_label=?''',(group,day,shift_label)).fetchone())
+        c.execute('''INSERT INTO exception_entry_audit
+         (changed_at,group_name,service_date,shift_label,actor_role,actor_name,old_state,new_state)
+         VALUES(?,?,?,?,?,?,?,?)''',
+         (now,group,day,shift_label,'changes',str(actor).strip(),
+          _ex_json.dumps(old_data,sort_keys=True),_ex_json.dumps(new,sort_keys=True)))
+    audit('CHANGE_COUNTS_EDIT',f'{group} {day} {shift_label} before={before},after={after}; {actor}')
+    return new
+
+
+def save_change_stage(actor, group, service_date, shift_label,
+                      expected_revision, stage, count):
+    """Save one deadline's change count without requiring a WhatsApp report.
+
+    The other stage and any linked actual-attendance report are left intact.
+    A submitted zero means a confirmed zero; an unsubmitted NULL is unknown.
+    """
+    if not str(actor).strip() or len(str(actor)) > 100:
+        raise PermissionError('Sign in to record changes.')
+    group = str(group).strip()
+    active = {x['name'].casefold() for x in group_registry() if x['enabled']}
+    if group.casefold() not in active:
+        raise ValueError('Group is not active. Enable it under Settings.')
+    day = parse_date(service_date).isoformat()
+    if shift_label not in EX_SHIFTS:
+        raise ValueError('Invalid shift.')
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise ValueError('Invalid entry revision.')
+    if stage not in ('before','after'):
+        raise ValueError('Choose before or after 15:00.')
+    value = _ex_validate_nonneg(count, 'Changes '+stage+' 15:00')
+    # These are fixed, reviewed SQL column names, never passed by the user.
+    field, by_field, at_field = {
+        'before': ('before_count','before_by','before_at'),
+        'after': ('after_count','after_by','after_at')
+    }[stage]
+    now = stamp()
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        old = c.execute("""SELECT * FROM exception_entries
+            WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label=?""",
+            (group,day,shift_label)).fetchone()
+        previous = dict(old) if old else {}
+        revision = int(previous.get('revision',0))
+        if revision != expected_revision:
+            raise RuntimeError('Another edit was saved. Reload this shift before continuing.')
+        if not old:
+            c.execute("""INSERT INTO exception_entries(group_name,service_date,shift_label,updated_at)
+                VALUES(?,?,?,?)""",(group,day,shift_label,now))
+        cur = c.execute(f"""UPDATE exception_entries SET {field}=?, {by_field}=?, {at_field}=?,
+            basis='already_actual',updated_at=?,revision=revision+1
+            WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label=?
+              AND revision=?""",
+            (value,str(actor).strip(),now,now,group,day,shift_label,revision))
+        if cur.rowcount != 1:
+            raise RuntimeError('Concurrent edit detected. Reload this shift.')
+        updated = dict(c.execute("""SELECT * FROM exception_entries WHERE
+            group_name=? COLLATE NOCASE AND service_date=? AND shift_label=?""",
+            (group,day,shift_label)).fetchone())
+        c.execute("""INSERT INTO exception_entry_audit
+            (changed_at,group_name,service_date,shift_label,actor_role,actor_name,old_state,new_state)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (now,group,day,shift_label,'changes_'+stage,str(actor).strip(),
+             _ex_json.dumps(previous,sort_keys=True),_ex_json.dumps(updated,sort_keys=True)))
+    audit('CHANGE_STAGE_SAVED',f'{group} {day} {shift_label}: {stage}={value}, actor={actor}')
+    return updated
+
+
+def link_final_attendance(actor,group,service_date,shift_label,
+                          expected_revision,report_id):
+    """Explicitly link an ambiguous/after-midnight WhatsApp snapshot after it arrives."""
+    if not str(actor).strip():
+        raise PermissionError('Sign in to link attendance.')
+    day=parse_date(service_date).isoformat()
+    group=str(group).strip()
+    if group.casefold() not in {x['name'].casefold() for x in group_registry() if x['enabled']}:
+        raise ValueError('Group is not active.')
+    if shift_label not in EX_SHIFTS:
+        raise ValueError('Invalid shift.')
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise ValueError('Invalid revision.')
+    try: report_id=int(report_id)
+    except (TypeError,ValueError): raise ValueError('Select an actual WhatsApp attendance report.')
+    if report_id not in {r['id'] for r in exception_reports(group,day)}:
+        raise ValueError('Report does not match this group/night-shift service window.')
+    now=stamp()
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        old=c.execute("""SELECT * FROM exception_entries
+            WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label=?""",
+            (group,day,shift_label)).fetchone()
+        previous=dict(old) if old else {}
+        if expected_revision != int(previous.get('revision',0)):
+            raise RuntimeError('This record has changed. Reload before linking a report.')
+        collision=c.execute("""SELECT service_date,shift_label FROM exception_entries
+            WHERE report_id=? AND NOT (group_name=? COLLATE NOCASE
+            AND service_date=? AND shift_label=?) LIMIT 1""",
+            (report_id,group,day,shift_label)).fetchone()
+        if collision:
+            raise ValueError('This WhatsApp report is already linked to '
+                             +collision['service_date']+' '+collision['shift_label'])
+        if not old:
+            c.execute("""INSERT INTO exception_entries(group_name,service_date,shift_label,updated_at)
+                VALUES(?,?,?,?)""",(group,day,shift_label,now))
+        cur=c.execute("""UPDATE exception_entries
+            SET report_id=?,basis='already_actual',updated_at=?,revision=revision+1
+            WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label=? AND revision=?""",
+            (report_id,now,group,day,shift_label,expected_revision))
+        if cur.rowcount!=1:
+            raise RuntimeError('Concurrent attendance edit detected. Reload.')
+        updated=dict(c.execute("""SELECT * FROM exception_entries
+            WHERE group_name=? COLLATE NOCASE AND service_date=? AND shift_label=?""",
+            (group,day,shift_label)).fetchone())
+        c.execute("""INSERT INTO exception_entry_audit
+            (changed_at,group_name,service_date,shift_label,actor_role,actor_name,old_state,new_state)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (now,group,day,shift_label,'attendance_link',str(actor).strip(),
+             _ex_json.dumps(previous,sort_keys=True),_ex_json.dumps(updated,sort_keys=True)))
+    audit('FINAL_ATTENDANCE_LINKED',f'{group} {day} {shift_label} linked report {report_id}')
+    return updated
+
+
+def calculate_exception(group, service_date, shift_label='Shift 1'):
+    """Calculate shortage by *role* from the actual WhatsApp snapshot.
+
+    A recorded change is an event, not automatically one employee missing.
+    The WhatsApp message is actual attendance, so never re-subtract operator
+    changes or no-shows (which would double-count absent staff).
+
+    Role shortages are summed; surplus in a different skill category does not
+    hide a safety-critical vacancy. Operator change logs are independent
+    of availability; an identifiable WhatsApp report is sufficient to show
+    a calculated shortage without waiting for manual change counts.
+    """
+    plan, plan_error = exception_plan(group, service_date)
+    record = exception_entry(group, service_date, shift_label)
+    snapshots = exception_reports(group, service_date)
+    result = {'group': group, 'service_date': service_date, 'shift': shift_label,
+              'plan_total': plan['planned_total'] if plan else None,
+              'plan_components': plan['components'] if plan else {},
+              'before_count': record['before_count'] if record else None,
+              'after_count': record['after_count'] if record else None,
+              'no_shows': None,  # WhatsApp only; historical manual values are ignored.
+              'staffing_reported': None, 'available': None, 'shortage': None,
+              'role_breakdown': [], 'group_total_gap': None,
+              'basis': 'already_actual',
+              'report_id': record['report_id'] if record else None,
+              'status': 'Pending', 'reason': '',
+              'revision': record['revision'] if record else 0}
+    if plan_error:
+        result['reason'] = plan_error
+        return result
+    if record and record['report_id'] is not None:
+        matching = [r for r in snapshots if r['id'] == record['report_id']]
+        if not matching:
+            result['reason'] = 'Selected WhatsApp report is missing or belongs to another date.'
+            return result
+        snapshot = matching[0]
+    elif len(snapshots)==1 and snapshots[0]['event_at'][:10] == service_date:
+        # Automatic matching is safe only with exactly one calendar-day report
+        # and no post-midnight competing report or other shift assignment.
+        with connect() as c:
+            other_shift = c.execute('''SELECT 1 FROM exception_entries
+                WHERE group_name=? COLLATE NOCASE AND service_date=?
+                AND shift_label<>? LIMIT 1''', (group,service_date,shift_label)).fetchone()
+            assigned_elsewhere = c.execute('''SELECT 1 FROM exception_entries
+                WHERE report_id=? AND NOT (group_name=? COLLATE NOCASE
+                AND service_date=? AND shift_label=?) LIMIT 1''',
+                (snapshots[0]['id'],group,service_date,shift_label)).fetchone()
+        if other_shift or assigned_elsewhere:
+            result['reason'] = 'Report already assigned to another shift. Select the correct final report.'
+            return result
+        snapshot = snapshots[0]
+    elif not snapshots:
+        result['reason'] = 'No WhatsApp attendance report for this group and date.'
+        return result
+    else:
+        result['reason'] = 'Select the final attendance message for this night shift (the message may be after midnight).'
+        return result
+
+    needed = [(role, EX_METRIC_FIELDS[role]) for role, required in plan['components'].items() if required > 0]
+    missing = [role for role, field in needed if snapshot[field] is None]
+    if missing:
+        result['reason'] = 'WhatsApp attendance is missing required role(s): ' + ', '.join(missing)
+        return result
+    role_breakdown = []
+    for role, field in EX_METRIC_FIELDS.items():
+        planned = int(plan['components'].get(role, 0))
+        raw_actual = snapshot[field]
+        # A role not required by the plan can be blank. It cannot substitute
+        # for a missing required role; show it as 0 only for total display.
+        present = int(raw_actual) if raw_actual is not None else 0
+        if present < 0:
+            result['reason'] = f'Invalid negative WhatsApp headcount for {role}.'
+            return result
+        role_breakdown.append({'role': role, 'required': planned, 'present': present,
+                               'shortage': max(0, planned - present),
+                               'surplus': max(0, present - planned)})
+    available = sum(r['present'] for r in role_breakdown)
+    shortage = sum(r['shortage'] for r in role_breakdown)
+    complete = bool(record and record['before_count'] is not None
+                    and record['after_count'] is not None)
+    reported_no_shows = whatsapp_no_shows_for_snapshot(group, service_date, snapshot)
+    result.update(staffing_reported=available, available=available,
+                  shortage=shortage, role_breakdown=role_breakdown,
+                  no_shows=reported_no_shows,
+                  group_total_gap=max(0, int(plan['planned_total']) - available),
+                  status='Complete' if complete else 'Attendance',
+                  reason=('Attendance captured; both change counts submitted.' if complete else
+                          'Attendance captured; change counts have not yet both been entered.'),
+                  report_id=snapshot['id'])
+    return result
+
+
+def exception_dashboard(start=None, end=None, group='All Groups'):
+    """Include unreviewed WhatsApp days so missing manual submissions are visible."""
+    start_iso = parse_date(start).isoformat() if start else None
+    end_iso = parse_date(end).isoformat() if end else None
+    conditions, params = [], []
+    if start_iso:
+        conditions.append('event_at>=?')
+        params.append(start_iso + 'T00:00:00')
+    if end_iso:
+        conditions.append('event_at<?')
+        params.append((_ex_datetime.fromisoformat(end_iso) + _ex_timedelta(days=1)).date().isoformat()+'T00:00:00')
+    if group != 'All Groups':
+        conditions.append('group_name=? COLLATE NOCASE')
+        params.append(group)
+    report_where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+    conditions2, params2 = [], []
+    if start_iso:
+        conditions2.append('service_date>=?'); params2.append(start_iso)
+    if end_iso:
+        conditions2.append('service_date<=?'); params2.append(end_iso)
+    if group != 'All Groups':
+        conditions2.append('group_name=? COLLATE NOCASE'); params2.append(group)
+    manual_where = ' WHERE ' + ' AND '.join(conditions2) if conditions2 else ''
+    with connect() as c:
+        # One after-midnight report linked to the previous shift must not be
+        # double-counted as an independent following-day staffing snapshot.
+        report_condition = ' AND ' if report_where else ' WHERE '
+        reports_sql = ('''SELECT DISTINCT r.group_name,substr(r.event_at,1,10)
+           FROM reports r''' + report_where + report_condition +
+           ''' (r.t002_t003 IS NOT NULL OR r.pwt IS NOT NULL
+                OR r.spl IS NOT NULL OR r.pl IS NOT NULL)
+             AND NOT EXISTS (SELECT 1 FROM exception_entries e
+               WHERE e.report_id=r.id AND e.service_date<>substr(r.event_at,1,10))''')
+        reports = [tuple(x) for x in c.execute(reports_sql, params)]
+        manual = [tuple(x) for x in c.execute('SELECT group_name,service_date,shift_label '
+                    'FROM exception_entries' + manual_where, params2)]
+    manual_by_day = {(g.casefold(), d) for g, d, shift in manual}
+    keys = set(manual)
+    for g, d in reports:
+        if (g.casefold(), d) not in manual_by_day:
+            keys.add((g, d, 'Shift 1'))
+    # Retain historical data from renamed/paused groups; new active groups
+    # appear in the editor immediately even before their first report.
+    rows = [calculate_exception(g, d, shift) for g, d, shift in
+            sorted(keys, key=lambda x:(x[1], x[0].casefold(), x[2]), reverse=True)]
+    calculable = [r for r in rows if r['status'] in ('Complete','Attendance')]
+    return dict(rows=rows,
+                changes_before=sum(r['before_count'] for r in rows if r['before_count'] is not None),
+                changes_after=sum(r['after_count'] for r in rows if r['after_count'] is not None),
+                changes_before_known=sum(r['before_count'] is not None for r in rows),
+                changes_after_known=sum(r['after_count'] is not None for r in rows),
+                no_shows=sum(r['no_shows'] for r in calculable if r['no_shows'] is not None),
+                no_shows_known=sum(r['no_shows'] is not None for r in calculable),
+                shortage=sum(r['shortage'] for r in calculable),
+                short_shifts=sum(r['shortage'] > 0 for r in calculable),
+                verified=len(calculable),
+                change_logs_complete=sum(r['status']=='Complete' for r in calculable),
+                pending=len(rows)-len(calculable),
+                awaiting_whatsapp=sum(r['reason'].startswith('No WhatsApp attendance report') for r in rows),
+                awaiting_manual_changes=sum(r['status']=='Attendance' for r in rows))
+
+
+
+def service_date_has_records(service_date):
+    """True for a persisted exception entry or WhatsApp staffing report.
+
+    Deliberately excludes the group registry: 40 registered groups are *not*
+    40 records. A manual entry may precede the final WhatsApp report.
+    """
+    day = parse_date(service_date).isoformat()
+    with connect() as c:
+        if c.execute('SELECT 1 FROM exception_entries WHERE service_date=? LIMIT 1',
+                     (day,)).fetchone():
+            return True
+        return bool(c.execute("""SELECT 1 FROM reports r
+            WHERE substr(r.event_at,1,10)=?
+              AND (r.t002_t003 IS NOT NULL OR r.pwt IS NOT NULL
+                   OR r.spl IS NOT NULL OR r.pl IS NOT NULL)
+              AND NOT EXISTS (
+                SELECT 1 FROM exception_entries e
+                WHERE e.report_id=r.id AND e.service_date<>?
+              ) LIMIT 1""", (day, day)).fetchone())
+
+
+def workforce_exception_chart_rows(rows, limit=10):
+    """Four independently reported KPI categories by group for the chart.
+
+    A missing no-show count is not converted into an asserted zero. Only
+    present counts contribute to the bar; the chart labels the coverage caveat.
+    Category totals are incident counts, NOT a unique-person headcount.
+    """
+    grouped={}
+    for r in rows:
+        name=str(r['group'])
+        g=grouped.setdefault(name, {'group':name, 'before':0, 'after':0,
+                                    'no_shows':0, 'shortage':0, 'no_shows_known':0})
+        for field, source in [('before','before_count'),('after','after_count'),
+                              ('no_shows','no_shows'),('shortage','shortage')]:
+            value=r.get(source)
+            if value is not None:
+                g[field]+=max(0,int(value))
+                if field=='no_shows':g['no_shows_known']+=1
+    result=sorted(grouped.values(),
+                  key=lambda g:(-(g['before']+g['after']+g['no_shows']+g['shortage']),
+                                g['group'].casefold()))
+    return result[:max(0,int(limit))]
+
+
+def exception_data_signature():
+    with connect() as c:
+        a = c.execute('SELECT COUNT(*),COALESCE(SUM(revision),0) FROM exception_entries').fetchone()
+        b = c.execute("SELECT revision FROM exception_sync_state WHERE id='plans'").fetchone()
+    return tuple(a) + tuple(b)
+
+
+init_exception_db()

@@ -1,165 +1,107 @@
-# Operational Intelligence — Local Executive Reporting
+# Rail Operational Intelligence — v3.0.0 | Overview & Reporting Hub
 
-**Python · SQLite · Jupyter Notebook · CustomTkinter · Optional WhatsApp Web monitoring**
+**Python · SQLite · CustomTkinter · Jupyter · Playwright (optional) · PDF/HTML reporting**
 
-A portfolio-ready, local-first demonstration of operational reporting: message
-normalisation, data quality validation, idempotent CSV/Excel ingestion, SQLite,
-workforce and safety KPI summaries, alert tracking, desktop visualisations and
-exportable reports. **No live APIs or externally hosted database are required.**
+A local-first desktop operational intelligence demonstration. **Release v3.0.0** introduces an executive Overview, workforce and safety monitoring, a separate Exceptions workflow for staffing changes before/after 15:00, manual/Excel staffing plans, and a searchable local Reports hub. Uses synthetic examples and no hosted database or external APIs; WhatsApp Web collection is optional and requires an authorized browser session.
 
-> **Publication notice:** The supplied input files were empty templates. Every
-> record in the committed demo database is synthetic. Before making this code
-> public, confirm the code owner/employer permits its release; review `SECURITY.md`.
-> No licence has been granted by this repository package: choose a licence only
-> after confirming the IP owner and publication rights.
+> **Publication warning:** The underlying application originated from an employer-connected workflow. Confirm you have permission to publish the **code itself**. Data in `examples/` is synthetic; no live records, browser sessions, credentials or actual employee information belong in a public repository. See [SECURITY.md](SECURITY.md).
 
-## Project layout
+## What changed since the first v2.8 package?
+
+See [CHANGELOG.md](CHANGELOG.md), [v3.0.0 release notes](RELEASE_NOTES_v3.0.0.md) and the [v2.8 → v3.0.0 application comparison](docs/MIGRATION_v2.8_to_v3.0.0.md).
+
+- New Overview and Reports hub, searchable file catalogue and collapsible navigation.
+- Changes before/after 15:00 and exception tracking with revision checks and audit history.
+- Date-effective staffing plans from read-only Excel tracker imports or manual entry.
+- Local administrator/operator users, hashed passwords, recovery codes and login sessions.
+- Expanded SQLite schema and exception-aware PDF / standalone HTML exports.
+- Existing WhatsApp collector and CSV/Excel formats preserved, with blank template rows ignored.
+
+## Repository layout
 
 ```text
-Operational_Intelligence_GitHub_Ready/
-├── README.md                     ← overview and setup
-├── core.py                       ← SQLite, imports, metrics, analytics, exports
-├── collector.py                  ← optional browser collector and CSV/Excel bridge
-├── desktop.py                    ← existing interactive executive GUI
-├── app.py                        ← launch dashboard
-├── manage.py                     ← headless CLI: init, import, status, make-demo
+├── app.py                    Desktop launcher
+├── core.py                   Data/analytics, staffing exceptions, user accounts and report engines
+├── collector.py              Optional authorized WhatsApp Web collector
+├── desktop.py                Overview/Exceptions/Reports GUI
+├── manage.py                 SQLite and ingestion CLI
+├── requirements.txt          Application dependencies
+├── requirements-dev.txt      Test tools
+├── CHANGELOG.md              Release history and change summary
+├── RELEASE_NOTES_v3.0.0.md  Release description for GitHub
+├── SECURITY.md               Privacy and local-security guidance
 ├── notebooks/
-│   └── Operational_Intelligence_Demo.ipynb
-├── templates/
-│   ├── WhatsAppData.xlsx         ← exact supplied empty Excel schema
-│   └── WhatsAppData_staging.csv  ← supplied empty CSV schema, blank rows trimmed
-├── examples/
-│   ├── demo_operations.db        ← 100% synthetic sample SQLite database
-│   ├── demo_WhatsAppData.csv     ← synthetic sample rows, same 11 columns
-│   └── demo_WhatsAppData.xlsx    ← synthetic sample workbook, same 11 columns
-├── docs/
-│   ├── architecture.md
-│   └── data_dictionary.md
-├── tests/                         ← import/validation/schema/date smoke tests
-└── data/                          ← local, private runtime files (gitignored)
+│   ├── Operational_Intelligence_v3.0.0.ipynb       Current application notebook (clean outputs)
+│   └── Operational_Intelligence_Demo.ipynb      Synthetic analytics walkthrough
+├── templates/                Original supplied CSV and Excel field layouts
+├── examples/                 168 synthetic reports, 2 synthetic plans, 8 exceptions (SQLite/CSV/Excel)
+├── docs/                     Architecture, data dictionary, schema, migration and GitHub guide
+├── tests/                    Headless regression tests
+├── .github/workflows/         Automated GitHub Actions tests
+└── data/.gitkeep              Private local runtime folder (never upload its contents)
 ```
 
-## Quick start
+## Run on Windows (VS Code, PowerShell)
 
-Use **Python 3.10–3.12**. Windows is recommended for the desktop interface;
-Linux/macOS require a working Tk installation and a graphical display.
+From the extracted root folder:
 
-```bash
-python -m venv .venv
-# Windows PowerShell: .venv\Scripts\Activate.ps1
-# macOS/Linux: source .venv/bin/activate
-python -m pip install -r requirements.txt
-python manage.py init
-python manage.py status
-python app.py
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe manage.py init
+.\.venv\Scripts\python.exe manage.py status
+.\.venv\Scripts\python.exe app.py
 ```
 
-The local database `data/operations.db` is created automatically; `manage.py init`
-also places **copies of both supplied template formats** in `data/` if missing.
-Live input files and the SQLite database are excluded from Git.
+Python 3.10–3.12 is the supported project target; a GUI environment is required for the dashboard.
 
-**Run without a browser or GUI:**
+To use synthetic data rather than a blank database, open the application and choose its synthetic-data option or run the CSV/Excel import command on a **new empty local database**:
 
-```bash
-python manage.py import --csv templates/WhatsAppData_staging.csv --excel templates/WhatsAppData.xlsx
-python manage.py status
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+```powershell
+.\.venv\Scripts\python.exe manage.py import --csv examples\demo_WhatsAppData.csv --excel examples\demo_WhatsAppData.xlsx
 ```
 
-The supplied files contain no records, so that import should insert **0** rows.
-When importing populated files, keep the original 11-column headings and DMY
-(`DD/MM/YYYY`) input dates. Duplicate messages across the CSV and workbook are
-ignored by their unique fingerprints. The **demo CSV/XLSX** retain the 11 original
-fields; privacy-minimised application exports omit raw `Full Message` text
-(10 fields). Re-importing those stripped exports can produce a different
-fingerprint from the original message and should not be used as a lossless
-synchronization mechanism. Use the original staging files for reconciliation.
+Both files contain matching synthetic records; deduplication should result in **168 inserted, 168 duplicates skipped**, for an empty database.
 
-## Explore the populated synthetic demo
+### Exploring the notebooks
 
-Open `notebooks/Operational_Intelligence_Demo.ipynb` in VS Code or Jupyter.
-Its examples run locally, read the committed synthetic database and **do not
-send data to an external service**. The demo includes 42 days of generated
-reports across two non-real teams (168 reports in the default seed).
+- `notebooks/Operational_Intelligence_v3.0.0.ipynb` is the source version of the standalone application: execute its cells **in order**, with the working directory set to the repository root, in a properly configured local Python environment.
+- `notebooks/Operational_Intelligence_Demo.ipynb` is a small read-only analytics walkthrough using the packaged synthetic database.
+- The normal application launch is via `app.py`, which avoids needing to execute every notebook cell manually.
 
-To create a new demo database in a different location:
+## Existing v2.8 database migration
 
-```bash
-python manage.py make-demo --output examples/my_fresh_demo.db
+Release v3.0.0 adds a nullable `no_shows` field to historical messages and creates additional exception, plan and account tables. **Back up an existing live `data/operations.db` outside the Git repository before running the new code.** The migration is one-way for this package; reverting to the old application version is not tested.
+
+On a new local install, `manage.py init` creates both the database and working copies of the input templates. Do not overwrite your actual local CSV/Excel sources with the synthetic files.
+
+## Optional collector
+
+For authorized local WhatsApp Web tests only:
+
+```powershell
+.\.venv\Scripts\python.exe -m playwright install chromium
+.\.venv\Scripts\python.exe app.py
 ```
 
-The CLI refuses to overwrite any existing DB. To explore the desktop application
-with synthetic data, use the in-app **Add synthetic demonstration data** control
-on a newly created local DB. Never mix synthetic and production records.
+Use the GUI Start/Stop controls and sign in to WhatsApp Web if prompted. This is browser UI collection, **not** the official WhatsApp API; UI selectors and access terms can change. Never include `whatsapp_session/` in Git.
 
-## Optional WhatsApp Web collection
+## Tests
 
-The collector is **disabled by default**. For an authorized local test:
-
-```bash
-python -m playwright install chromium
-python app.py
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Use the application's monitoring controls and authenticate in the browser when
-prompted. Change monitored group names in Settings to exact titles you are
-authorized to observe. This uses a local WhatsApp Web browser session, not an
-official WhatsApp API. The browser UI may change and collection is not
-contractually guaranteed; review platform terms and privacy requirements.
+The automated suite covers template inputs, date semantics, deduplication, no-show null handling, expanded database schema, staffing plans, before/after-15:00 workflows, account creation/recovery and local database integrity. Live GUI/authenticated WhatsApp testing is manual, and actual employer data has not been used.
 
-Live records follow this pipeline:
+## Documentation and updates
 
-`WhatsApp → parsed metrics → local staging CSV + Excel → SQLite → executive dashboard`
+- [System architecture](docs/architecture.md)
+- [Database and field definitions](docs/data_dictionary.md)
+- [SQLite reference schema](docs/schema.sql)
+- [Comparison with original v2.8](docs/MIGRATION_v2.8_to_v3.0.0.md)
+- [How to update your existing GitHub repository](docs/GITHUB_UPDATE_GUIDE.md)
+- [Security guidance](SECURITY.md)
 
-Startup also reconciles existing staging CSV entries into SQLite; the import
-uses a unique fingerprint to avoid duplicates.
-
-## Features
-
-- Data quality: explicit DMY/MDY separation; missing values remain null;
-  invalid dates are rejected; completely empty template rows are ignored.
-- Local SQLite: durable report store, alert and audit tables, deduplication,
-  monitored status, backup, and optional database relocation.
-- Executive UI: time and group filters, workforce totals, near-miss charts,
-  alerts, monitoring health, reports, theme toggle, CSV/Excel/PDF/offline HTML exports.
-- Offline analytics: trend summaries, scenario projections and explicitly
-  labelled synthetic demonstration data.
-
-**Interpretation:** Counts derived from group messages are **unverified reported
-values**, not confirmed incidents, verified employee attendance, or validated
-compliance metrics. The original UI is desktop-based (not a hosted website).
-
-## Engineering status and known limitations
-
-Automated tests cover CSV/Excel template compatibility, date semantics, blank
-rows, idempotency, the SQLite schema, and core summaries. Full graphical UI,
-browser selectors, network connectivity and WhatsApp authentication require
-manual testing on a supported desktop; they are not simulated by the tests.
-The collector uses screen/UI scraping rather than an API and may need selector
-updates as WhatsApp Web changes.
-
-The manual change/no-show/shortage categories discussed for later expansion
-**are not present in the supplied two files**; this release does not fabricate
-those measures. See `docs/architecture.md` for the integration boundary.
-
-## Release checklist
-
-## Documentation
-
-For a deeper understanding of the platform's design, implementation, and data management practices, refer to the following technical documentation:
-
-- [System Architecture](https://github.com/SamudraDeSilva/WhatsApp_operational_intelligence/blob/main/docs/architecture.md) — Application architecture, component interactions, and data processing workflows.
-- [Data Dictionary](https://github.com/SamudraDeSilva/WhatsApp_operational_intelligence/blob/main/docs/data_dictionary.md) — Database structure, field definitions, and operational reporting schema.
-- [Security Guidelines](https://github.com/SamudraDeSilva/WhatsApp_operational_intelligence/blob/main/SECURITY.md) — Data protection, privacy considerations, and responsible deployment practices.
-
-## Project Status
-
-**Version:** 2.8 — Demonstration Release
-
-This repository contains a demonstration implementation of the Operational Intelligence Platform, including synthetic datasets, automated reporting workflows, and executive analytics capabilities.
-
-Live integrations and deployment-specific configurations require additional setup, testing, and appropriate authorisation.
-
-See [the data dictionary](docs/data_dictionary.md),
-[architecture](docs/architecture.md) and [security guidance](SECURITY.md).
+**Release status:** v3.0.0 GitHub package with the current application notebook and synthetic example data; GUI and WhatsApp connectivity require real desktop validation before a production claim. This repository intentionally has no license until code ownership and permission are verified.

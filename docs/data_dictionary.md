@@ -1,31 +1,27 @@
-# Data dictionary and source compatibility
+# Data dictionary — v3.0.0
 
-The uploaded `WhatsAppData.xlsx` and `WhatsAppData_staging(1).csv` were both
-**header-only**. Their shared column order is retained in the templates, with
-blank preformatted CSV rows removed. The filename `WhatsAppData_staging(1).csv`
-was normalized to `WhatsAppData_staging.csv` for the application.
+## Original staging structure (unchanged)
 
-| Source column | SQLite column | Expected interpretation |
-|---|---|---|
-| Date | `event_at` (date component) | DMY / ISO accepted from CSV or Excel |
-| Time | `event_at` (time component) | 24-hour or 12-hour time |
-| Group | `group_name` | Exact reported group title |
-| Sender | `sender` | Reported message sender |
-| Full Message | `message` | Full source text; sensitive if real |
-| T002/T003 | `t002_t003` | Non-negative, reported count |
-| PWT | `pwt` | Non-negative, reported count |
-| SPL | `spl` | Non-negative, reported count |
-| PL | `pl` | Non-negative, reported count |
-| Near Miss | `near_miss` | Reported count, not a verified incident count |
-| Late | `late` | Reported count |
+`Date`, `Time`, `Group`, `Sender`, `Full Message`, `T002/T003`, `PWT`, `SPL`, `PL`, `Near Miss`, `Late`.
 
-The database additionally includes `id`, `fingerprint`, `captured_at`, `origin`
-and `quality_note`. `fingerprint` supports idempotent re-import. Missing metric
-values are **NULL**, not zero. Completely blank input rows are skipped.
+Input date fields use `DD/MM/YYYY`; WhatsApp Web metadata is parsed separately.
+Keep both the original CSV and Excel headers when using the collector or importer.
 
-The sample database is labelled synthetic (`origin='demo'`) and is not derived
-from real WhatsApp activity. Demo dates are generated relative to the run date.
+## SQLite data model
 
-Source names `T002/T003`, `PWT`, `SPL`, and `PL` are preserved without inventing
-business definitions that were not provided. Clarify these category definitions
-before interpreting totals as headcount, attendance compliance or site KPIs.
+- `reports`: per-message records, timestamp, group, sender, original message, staffing-role metrics, `near_miss`, `late`, optional `no_shows`, origin, quality information and unique fingerprint.
+- `staffing_plans`: imported, date-effective plans from visible Excel worksheets.
+- `manual_staffing_plans`: manually entered role requirements with validity by start date.
+- `manual_staffing_plan_audit`: historical edits to plan versions.
+- `exception_entries`: per-group, per-service-date, per-shift changes before/after 15:00 and optional linked attendance snapshot. A NULL indicates unknown/not yet recorded, not zero.
+- `exception_entry_audit`: historical changes to exceptions.
+- `exception_sync_state`: internal revision state for cache/refresh invalidation.
+- `app_users`: local account identifiers, roles, salted password hashes, recovery hashes, lockout and status metadata. The demo DB contains **no configured user accounts**.
+- `exception_users`: compatibility for older single-operator credentials.
+- `audit`, `alerts`, `monitor_state`, `collection_diagnostics`: reporting and operational diagnostics.
+
+## Local file catalogue
+
+`data/reports/report_catalog.json` indexes report paths, timestamps and selected scope. It is machine-local and deliberately excluded from the repository.
+
+See `schema.sql` for a SQLite-only reference schema; the definitive creation and migration logic lives in `core.init_db()` and `core.init_exception_db()`.
