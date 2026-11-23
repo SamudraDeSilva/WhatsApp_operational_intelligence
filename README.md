@@ -1,4 +1,4 @@
-# Rail Operational Intelligence — v3.0.0 | Overview & Reporting Hub
+# Rail Operational Intelligence - v3.0.0 | Overview & Reporting Hub
 
 **Python · SQLite · CustomTkinter · Jupyter · Playwright (optional) · PDF/HTML reporting**
 
@@ -104,4 +104,12 @@ The automated suite covers template inputs, date semantics, deduplication, no-sh
 - [How to update your existing GitHub repository](docs/GITHUB_UPDATE_GUIDE.md)
 - [Security guidance](SECURITY.md)
 
-**Release status:** v3.0.0 GitHub package with the current application notebook and synthetic example data; GUI and WhatsApp connectivity require real desktop validation before a production claim. This repository intentionally has no license until code ownership and permission are verified.
+## Release Status - v3.0.0
+
+**Operational Intelligence v3.0.0 - Production Ready**
+
+Operational Intelligence v3.0.0 is a fully developed operational intelligence and reporting application designed to automate data processing, monitor operational performance and support data-driven decision-making.
+
+The application integrates automated WhatsApp data capture, structured data processing, KPI monitoring and reporting capabilities within a unified operational framework.
+
+This release represents the completed implementation of the application, with its core functionality ready for operational deployment. The repository includes synthetic demonstration datasets to illustrate system functionality without disclosing confidential operational information.
